@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flask Example App - Applied Intuition</title>
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <div class="logo-container">
+                    <img src="{{ url_for('static', filename='applied-logo.png') }}" alt="Applied Intuition" class="logo">
+                    <div class="app-title">Example App</div>
+                </div>
+            </div>
+            
+            <nav class="nav">
+                <ul>
+                    <li>
+                        <button class="nav-item active">Home</button>
+                    </li>
+                    <li>
+                        <button class="nav-item">About</button>
+                    </li>
+                </ul>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="version">Version 1.0.0</div>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main-content">
+            <div class="content-wrapper">
+                <h1 class="page-title">Hello Applied Intuition</h1>
+                
+                <div class="card api-response-card">
+                    <h2 class="card-title">API Response</h2>
+                    
+                    <div id="api-content" class="loading-container">
+                        <div class="spinner"></div>
+                        <span>Loading...</span>
+                    </div>
+                </div>
+
+                <div class="info-grid">
+                    <div class="info-card">
+                        <div class="info-label">Backend</div>
+                        <div class="info-value">Python + Flask</div>
+                    </div>
+                    
+                    <div class="info-card">
+                        <div class="info-label">Frontend</div>
+                        <div class="info-value">HTML + CSS</div>
+                    </div>
+                    
+                    <div class="info-card">
+                        <div class="info-label">Styling</div>
+                        <div class="info-value">Custom CSS</div>
+                    </div>
+                    
+                    <div class="info-card">
+                        <div class="info-label">Deployment</div>
+                        <div class="info-value">Apps Platform</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Fetch API data
+        fetch('/api/hello')
+            .then(response => response.json())
+            .then(data => {
+                const apiContent = document.getElementById('api-content');
+                apiContent.className = 'api-message';
+                apiContent.textContent = data.message;
+            })
+            .catch(error => {
+                const apiContent = document.getElementById('api-content');
+                apiContent.className = 'error-message';
+                apiContent.textContent = 'Error: ' + error.message;
+            });
+
+        // Simple navigation
+        document.querySelectorAll('.nav-item').forEach(item => {
+            item.addEventListener('click', function() {
+                document.querySelectorAll('.nav-item').forEach(i => i.classList.remove('active'));
+                this.classList.add('active');
+            });
+        });
+    </script>
+</body>
+</html>

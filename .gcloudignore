@@ -1,0 +1,8 @@
+# Exclude the .git directory and the ignore files themselves
+.git/
+.gitignore
+.gcloudignore
+
+# Import your existing gitignore rules
+#!include:.gitignore
+

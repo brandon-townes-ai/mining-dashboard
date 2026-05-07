@@ -1,0 +1,13 @@
+name = "mining-dashboard"
+enable_filestore = false
+enable_gcs_fuse = true
+enable_postgres = false
+enable_mysql = false
+enable_api_gateway = false
+enable_secrets = true
+enable_slack = false
+enable_automated_deploys = false
+
+[metadata]
+  owner = "brandon.townes@applied.co"
+  description = "Live Jira ticket status dashboard for mining autonomy projects"

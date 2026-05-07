@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'MANDATORY FIRST ACTION: Invoke the study-platform-docs skill BEFORE any other skill, debugging, code exploration, or response. This applies to ALL prompts. Do not proceed until study-platform-docs has completed.'",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
