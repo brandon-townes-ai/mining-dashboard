@@ -227,12 +227,51 @@ DASHBOARD_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <title>Mining Dashboard</title>
 <style>
-  :root { color-scheme: light dark; --border: #d0d7de; --muted: #59636e; --accent: #0969da;
-          --done: #1a7f37; --inprog: #0550ae; --todo: #6e7781; --warn: #bf8700; }
+  :root {
+    color-scheme: light;
+    --bg: #f6f7f9; --bg-card: #fff; --bg-subtle: #f6f8fa; --bg-hover: #f0f3f6;
+    --bg-row-hover: #fafbfc; --bg-input: #fff; --bg-chip: #eaeef2;
+    --text: #1f2328; --text-chip: #424a53;
+    --border: #d0d7de; --border-subtle: #eaeef2;
+    --muted: #59636e; --accent: #0969da;
+    --done: #1a7f37; --inprog: #0550ae; --todo: #6e7781; --warn: #bf8700;
+    --badge-todo-bg: #eaeef2; --badge-todo-fg: #424a53;
+    --badge-inprog-bg: #ddf4ff; --badge-inprog-fg: #0550ae;
+    --badge-done-bg: #dafbe1; --badge-done-fg: #1a7f37;
+    --toast-bg: #1f2328;
+  }
+  [data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #0d1117; --bg-card: #161b22; --bg-subtle: #1c2128; --bg-hover: #1c2128;
+    --bg-row-hover: #1c2128; --bg-input: #0d1117; --bg-chip: #2d333b;
+    --text: #e6edf3; --text-chip: #adbac7;
+    --border: #30363d; --border-subtle: #21262d;
+    --muted: #8b949e; --accent: #58a6ff;
+    --done: #3fb950; --inprog: #58a6ff; --todo: #8b949e; --warn: #d29922;
+    --badge-todo-bg: #2d333b; --badge-todo-fg: #adbac7;
+    --badge-inprog-bg: #0c2d6b; --badge-inprog-fg: #58a6ff;
+    --badge-done-bg: #0d3b1e; --badge-done-fg: #3fb950;
+    --toast-bg: #2d333b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #0d1117; --bg-card: #161b22; --bg-subtle: #1c2128; --bg-hover: #1c2128;
+      --bg-row-hover: #1c2128; --bg-input: #0d1117; --bg-chip: #2d333b;
+      --text: #e6edf3; --text-chip: #adbac7;
+      --border: #30363d; --border-subtle: #21262d;
+      --muted: #8b949e; --accent: #58a6ff;
+      --done: #3fb950; --inprog: #58a6ff; --todo: #8b949e; --warn: #d29922;
+      --badge-todo-bg: #2d333b; --badge-todo-fg: #adbac7;
+      --badge-inprog-bg: #0c2d6b; --badge-inprog-fg: #58a6ff;
+      --badge-done-bg: #0d3b1e; --badge-done-fg: #3fb950;
+      --toast-bg: #2d333b;
+    }
+  }
   * { box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-         margin: 0; background: #f6f7f9; color: #1f2328; }
-  .card { background: #fff; border: 1px solid var(--border); border-radius: 10px;
+         margin: 0; background: var(--bg); color: var(--text); }
+  .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px;
           box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
           gap: 0.75rem; margin-bottom: 1rem; }
@@ -252,31 +291,31 @@ DASHBOARD_HTML = r"""<!doctype html>
   .chart-card .canvas-wrap { position: relative; height: 200px; }
   .chart-card.empty { color: var(--muted); font-size: 0.85rem; padding: 1rem; }
   header { display: flex; gap: 0.75rem; padding: 0.75rem 1rem; border-bottom: 1px solid var(--border);
-           background: #fff; align-items: center; flex-wrap: wrap; }
+           background: var(--bg-card); align-items: center; flex-wrap: wrap; }
   header h1 { margin: 0; font-size: 1rem; flex-shrink: 0; }
   .grow { flex: 1; }
   button, select, input[type=text], input[type=password] {
     font: inherit; padding: 0.4rem 0.6rem; border: 1px solid var(--border);
-    border-radius: 6px; background: #fff;
+    border-radius: 6px; background: var(--bg-input); color: var(--text);
   }
   button { cursor: pointer; }
-  button:hover { background: #f0f3f6; }
+  button:hover { background: var(--bg-hover); }
   button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-  button.primary:hover { background: #0860c5; }
+  button.primary:hover { opacity: 0.88; }
   button.danger { color: #cf222e; }
   main { padding: 1rem; }
   .meta { color: var(--muted); font-size: 0.85rem; }
   .err { color: #cf222e; }
   .toolbar { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; align-items: center; flex-wrap: wrap; }
   .toolbar input[type=text] { flex: 1; min-width: 320px; }
-  table { width: 100%; border-collapse: collapse; background: #fff;
+  table { width: 100%; border-collapse: collapse; background: var(--bg-card);
           border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
   table { box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
-  th, td { text-align: left; padding: 0.55rem 0.85rem; border-bottom: 1px solid #eaeef2;
+  th, td { text-align: left; padding: 0.55rem 0.85rem; border-bottom: 1px solid var(--border-subtle);
            font-size: 0.875rem; vertical-align: top; }
-  th { background: #f6f8fa; cursor: pointer; user-select: none; font-weight: 600;
+  th { background: var(--bg-subtle); cursor: pointer; user-select: none; font-weight: 600;
        white-space: nowrap; }
-  tr:hover td { background: #fafbfc; }
+  tr:hover td { background: var(--bg-row-hover); }
   th.sorted-asc::after  { content: " ▲"; }
   th.sorted-desc::after { content: " ▼"; }
   tr:last-child td { border-bottom: none; }
@@ -284,18 +323,18 @@ DASHBOARD_HTML = r"""<!doctype html>
   a.key:hover, a.link:hover { text-decoration: underline; }
   .badge { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 999px;
            font-size: 0.75rem; font-weight: 600; }
-  .cat-new, .cat-undefined { background: #eaeef2; color: #424a53; }
-  .cat-indeterminate       { background: #ddf4ff; color: #0550ae; }
-  .cat-done                { background: #dafbe1; color: #1a7f37; }
+  .cat-new, .cat-undefined { background: var(--badge-todo-bg); color: var(--badge-todo-fg); }
+  .cat-indeterminate       { background: var(--badge-inprog-bg); color: var(--badge-inprog-fg); }
+  .cat-done                { background: var(--badge-done-bg); color: var(--badge-done-fg); }
   .chip { display: inline-block; padding: 0.1rem 0.45rem; margin: 0 0.15rem 0.15rem 0;
-          background: #eaeef2; border-radius: 4px; font-size: 0.75rem; }
+          background: var(--bg-chip); color: var(--text); border-radius: 4px; font-size: 0.75rem; }
   .avatar { width: 18px; height: 18px; border-radius: 50%; vertical-align: middle; margin-right: 0.3rem; }
 
   /* drawer */
-  .drawer-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: none; z-index: 100; }
+  .drawer-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: none; z-index: 100; }
   .drawer-bg.open { display: block; }
   .drawer { position: fixed; right: 0; top: 0; bottom: 0; width: 480px; max-width: 100vw;
-            background: #fff; border-left: 1px solid var(--border); padding: 1rem; overflow-y: auto;
+            background: var(--bg-card); border-left: 1px solid var(--border); padding: 1rem; overflow-y: auto;
             transform: translateX(100%); transition: transform 0.18s; z-index: 101; }
   .drawer.open { transform: translateX(0); }
   .drawer h2 { margin: 0 0 0.75rem; font-size: 1.05rem; }
@@ -304,7 +343,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .drawer label { display: block; font-size: 0.8rem; margin: 0.5rem 0 0.2rem; color: var(--muted); }
   .drawer input[type=text], .drawer input[type=password], .drawer select, .drawer textarea {
     width: 100%; padding: 0.4rem 0.6rem; border: 1px solid var(--border); border-radius: 6px;
-    font: inherit;
+    font: inherit; background: var(--bg-input); color: var(--text);
   }
   .drawer textarea { min-height: 64px; resize: vertical; }
   .row { display: flex; gap: 0.5rem; align-items: center; }
@@ -313,14 +352,16 @@ DASHBOARD_HTML = r"""<!doctype html>
   .field-picker { border: 1px solid var(--border); border-radius: 6px;
                   max-height: 240px; overflow-y: auto; padding: 0.4rem; }
   .field-picker label { display: flex; align-items: center; gap: 0.4rem; padding: 0.15rem 0.2rem;
-                        margin: 0; font-size: 0.85rem; color: #1f2328; cursor: pointer; }
-  .field-picker label:hover { background: #f6f8fa; }
+                        margin: 0; font-size: 0.85rem; color: var(--text); cursor: pointer; }
+  .field-picker label:hover { background: var(--bg-subtle); }
   .selected-cols { display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.4rem; }
   .selected-cols .chip { display: inline-flex; align-items: center; gap: 0.3rem; }
   .selected-cols .chip button { padding: 0; border: none; background: transparent; cursor: pointer; color: var(--muted); }
   .toast { position: fixed; bottom: 1rem; right: 1rem; padding: 0.55rem 0.85rem;
-           background: #1f2328; color: #fff; border-radius: 6px; font-size: 0.85rem; z-index: 200; }
-  .toast.err { background: #cf222e; }
+           background: var(--toast-bg); color: var(--text); border: 1px solid var(--border);
+           border-radius: 6px; font-size: 0.85rem; z-index: 200; }
+  .toast.err { background: #cf222e; color: #fff; border-color: #cf222e; }
+  #btn-theme { font-size: 1rem; padding: 0.3rem 0.5rem; line-height: 1; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 </head>
@@ -333,6 +374,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <span class="grow"></span>
   <span class="meta" id="status">—</span>
   <button id="btn-refresh">Refresh</button>
+  <button id="btn-theme" title="Toggle dark mode">🌙</button>
   <button id="btn-settings">Settings</button>
 </header>
 
@@ -861,6 +903,28 @@ $("#btn-rename-view").addEventListener("click", renameView);
 $("#btn-delete-view").addEventListener("click", deleteCurrentView);
 $("#btn-reload-fields").addEventListener("click", loadFields);
 $("#field-search").addEventListener("input", renderFieldPicker);
+
+// ---------- theme ----------
+
+function getTheme() {
+  const stored = localStorage.getItem("theme");
+  if (stored) return stored;
+  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  $("#btn-theme").textContent = theme === "dark" ? "☀️" : "🌙";
+  $("#btn-theme").title = theme === "dark" ? "Switch to light mode" : "Switch to dark mode";
+}
+
+$("#btn-theme").addEventListener("click", () => {
+  const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+  localStorage.setItem("theme", next);
+  applyTheme(next);
+});
+
+applyTheme(getTheme());
 
 (async function init() {
   await loadConfig();
