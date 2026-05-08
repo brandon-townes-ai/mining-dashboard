@@ -102,6 +102,20 @@ def create_app(store: ConfigStore) -> Flask:
             return jsonify({"error": "project query param required"}), 400
         return jsonify(holder.get().list_components(project))
 
+    @app.get("/api/children/<issue_key>")
+    def api_children(issue_key: str):
+        columns = request.args.get("columns")
+        view_name = request.args.get("view") or store.get_active()
+        view = store.get_view(view_name) or {}
+        column_list = [c.strip() for c in columns.split(",")] if columns else list(view.get("columns", []))
+        request_fields = _expand_request_fields(column_list)
+        client = holder.get()
+        jql = f"parent = {issue_key} ORDER BY status ASC"
+        issues = client.search_issues(jql, request_fields, max_results=50)
+        tickets = [_shape_issue(i["key"], i.get("fields", {}), column_list, client.base_url)
+                   for i in issues]
+        return jsonify({"jira_base_url": client.base_url, "columns": column_list, "tickets": tickets})
+
     @app.get("/api/tickets")
     def api_tickets():
         view_name = request.args.get("view") or store.get_active()
@@ -138,13 +152,31 @@ def create_app(store: ConfigStore) -> Flask:
                 except (ValueError, JiraConfigError) as exc:
                     tickets.append({"key": k, "_error": str(exc),
                                     "summary": str(exc), "values": {}})
+        # One batch query to find which tickets have children
+        keys_with_children: set[str] = set()
+        if tickets:
+            keys_in = ", ".join(t["key"] for t in tickets)
+            try:
+                child_hits = client.search_issues(
+                    f"parent in ({keys_in})", ["parent"], max_results=500
+                )
+                for hit in child_hits:
+                    pk = ((hit.get("fields") or {}).get("parent") or {}).get("key")
+                    if pk:
+                        keys_with_children.add(pk)
+            except Exception:
+                pass
+
+        for t in tickets:
+            t["has_children"] = t["key"] in keys_with_children
+
         return jsonify({"jira_base_url": client.base_url, "columns": column_list, "tickets": tickets})
 
     return app
 
 
 SPECIAL_COLUMNS = {"key"}
-COLUMN_TO_FIELD = {"epic": "parent"}
+COLUMN_TO_FIELD = {"epic": "parent", "occurrence_count": "subtasks"}
 
 
 def _expand_request_fields(columns: list[str]) -> list[str]:
@@ -198,6 +230,9 @@ def _render_field(field_id: str, raw, base_url: str):
         return {"type": "json", "display": _short_json(raw), "sort": _short_json(raw)}
 
     if isinstance(raw, list):
+        if field_id == "subtasks":
+            count = len(raw)
+            return {"type": "number", "display": str(count), "sort": count}
         items = [_render_field(field_id, x, base_url) for x in raw]
         labels = [i.get("display") for i in items if i.get("display")]
         return {"type": "list", "items": items, "display": ", ".join(labels), "sort": ", ".join(labels)}
@@ -210,6 +245,8 @@ def _render_field(field_id: str, raw, base_url: str):
         return {"type": "number", "display": str(raw), "sort": raw}
 
     if isinstance(raw, str):
+        if len(raw) >= 10 and raw[4:5] == "-" and raw[7:8] == "-" and (raw[10:11] in ("T", " ", "")):
+            return {"type": "date", "display": raw[:10], "sort": raw}
         return {"type": "text", "display": raw, "sort": raw}
 
     return {"type": "json", "display": str(raw), "sort": str(raw)}
@@ -280,9 +317,12 @@ DASHBOARD_HTML = r"""<!doctype html>
                 letter-spacing: 0.04em; }
   .kpi .value { font-size: 1.6rem; font-weight: 600; margin-top: 0.2rem; }
   .kpi .sub { color: var(--muted); font-size: 0.78rem; margin-top: 0.2rem; }
-  .kpi.done .value  { color: var(--done); }
-  .kpi.inprog .value { color: var(--inprog); }
-  .kpi.todo .value  { color: var(--todo); }
+  .kpi.done .value    { color: var(--done); }
+  .kpi.inprog .value  { color: var(--inprog); }
+  .kpi.todo .value    { color: var(--todo); }
+  .kpi.blocked .value { color: #cf222e; }
+  .kpi.triage .value  { color: var(--warn); }
+  .kpi.waiting .value { color: var(--warn); }
   .charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
             gap: 0.75rem; margin-bottom: 1rem; }
   .chart-card { padding: 0.75rem 0.9rem; }
@@ -329,6 +369,14 @@ DASHBOARD_HTML = r"""<!doctype html>
   .chip { display: inline-block; padding: 0.1rem 0.45rem; margin: 0 0.15rem 0.15rem 0;
           background: var(--bg-chip); color: var(--text); border-radius: 4px; font-size: 0.75rem; }
   .avatar { width: 18px; height: 18px; border-radius: 50%; vertical-align: middle; margin-right: 0.3rem; }
+  .expand-btn { background: none; border: none; padding: 0 0.3rem 0 0; cursor: pointer;
+                color: var(--muted); font-size: 0.7rem; line-height: 1; vertical-align: middle;
+                transition: transform 0.15s; display: inline-block; }
+  .expand-btn.open { transform: rotate(90deg); }
+  tr.child-row td { background: var(--bg); border-bottom: 1px solid var(--border-subtle); }
+  tr.child-row td:first-child { padding-left: 2.2rem; }
+  tr.child-row:hover td { background: var(--bg-hover); }
+  tr.child-loading td { color: var(--muted); font-size: 0.85rem; padding-left: 2.2rem; }
 
   /* drawer */
   .drawer-bg { position: fixed; inset: 0; background: rgba(0,0,0,0.5); display: none; z-index: 100; }
@@ -579,6 +627,7 @@ function renderSelectedCols() {
 function columnLabel(col) {
   if (col === "key") return "Key";
   if (col === "epic") return "Epic";
+  if (col === "occurrence_count") return "Occurrences";
   const f = STATE.fieldById.get(col);
   return f?.name || col;
 }
@@ -599,24 +648,45 @@ const PALETTE = ["#0969da","#1a7f37","#bf8700","#cf222e","#8250df","#0550ae","#6
 
 const CHART_INSTANCES = new Map();
 
+const ACTION_STATUSES = [
+  {match: "needs triage",          label: "Needs Triage",          cls: "triage"},
+  {match: "blocked",               label: "Blocked",               cls: "blocked"},
+  {match: "waiting for customer",  label: "Waiting for Customer",  cls: "waiting"},
+  {match: "containment",           label: "Containment",           cls: "waiting"},
+  {match: "corrective action",     label: "Corrective Action",     cls: "inprog"},
+];
+
 function renderKpis() {
   const total = STATE.tickets.length;
   let done = 0, inprog = 0, todo = 0, hasStatus = false;
+  const actionCounts = new Map(ACTION_STATUSES.map(s => [s.match, 0]));
+
   for (const t of STATE.tickets) {
     const s = t.values?.status;
-    if (!s) continue;
+    if (!s || s.type === "empty") continue;
     hasStatus = true;
+    const lower = (s.display || "").toLowerCase();
     if (s.category === "done") done++;
     else if (s.category === "indeterminate") inprog++;
     else todo++;
+    for (const as of ACTION_STATUSES) {
+      if (lower === as.match) actionCounts.set(as.match, actionCounts.get(as.match) + 1);
+    }
   }
+
   const pct = n => total ? Math.round((n / total) * 100) + "%" : "—";
+  const actionTiles = ACTION_STATUSES
+    .map(as => ({ cls: as.cls, label: as.label, value: actionCounts.get(as.match), sub: pct(actionCounts.get(as.match)) }))
+    .filter(t => t.value > 0);
+
   const tiles = [
     {label: "Total tickets", value: total, sub: ""},
     hasStatus && {cls: "done",   label: "Done",        value: done,   sub: pct(done)},
     hasStatus && {cls: "inprog", label: "In progress", value: inprog, sub: pct(inprog)},
     hasStatus && {cls: "todo",   label: "To do",       value: todo,   sub: pct(todo)},
+    ...actionTiles,
   ].filter(Boolean);
+
   $("#kpis").innerHTML = tiles.map(t =>
     `<div class="card kpi ${t.cls || ''}">
       <div class="label">${fmt(t.label)}</div>
@@ -729,6 +799,8 @@ async function loadTickets() {
     STATE.tickets = data.tickets;
     STATE.columns = data.columns;
     STATE.jiraBase = data.jira_base_url;
+    CHILD_CACHE.clear();
+    EXPANDED.clear();
     renderKpis();
     renderCharts();
     renderTable();
@@ -749,6 +821,9 @@ function scheduleRefresh() {
   const secs = Math.max(5, parseInt(STATE.workingView.refresh_seconds, 10) || 60);
   STATE.refreshTimer = setInterval(loadTickets, secs * 1000);
 }
+
+const CHILD_CACHE = new Map();
+const EXPANDED = new Set();
 
 function renderTable() {
   const head = $("#head-row");
@@ -777,10 +852,74 @@ function renderTable() {
   }
 
   const tbody = $("#tbl tbody");
-  tbody.innerHTML = rows.map(t => {
-    const cells = STATE.columns.map(c => `<td>${renderCell(t, c)}</td>`).join("");
-    return `<tr>${cells}</tr>`;
-  }).join("");
+  tbody.innerHTML = "";
+  for (const t of rows) {
+    const tr = document.createElement("tr");
+    tr.dataset.key = t.key;
+    tr.innerHTML = STATE.columns.map(c => `<td>${renderCell(t, c, !!t.has_children)}</td>`).join("");
+    tbody.appendChild(tr);
+
+    if (EXPANDED.has(t.key)) {
+      appendChildRows(tbody, t.key, STATE.columns);
+    }
+  }
+
+  tbody.querySelectorAll(".expand-btn").forEach(btn => {
+    btn.addEventListener("click", e => {
+      e.preventDefault();
+      const key = btn.dataset.key;
+      if (EXPANDED.has(key)) {
+        EXPANDED.delete(key);
+        btn.classList.remove("open");
+        tbody.querySelectorAll(`tr.child-row[data-parent="${CSS.escape(key)}"]`).forEach(r => r.remove());
+      } else {
+        EXPANDED.add(key);
+        btn.classList.add("open");
+        const parentRow = tbody.querySelector(`tr[data-key="${CSS.escape(key)}"]`);
+        appendChildRows(tbody, key, STATE.columns, parentRow);
+      }
+    });
+  });
+}
+
+function appendChildRows(tbody, key, columns, afterRow) {
+  if (CHILD_CACHE.has(key)) {
+    insertChildRows(tbody, key, columns, CHILD_CACHE.get(key), afterRow);
+    return;
+  }
+  const loadingTr = document.createElement("tr");
+  loadingTr.className = "child-loading";
+  loadingTr.dataset.parent = key;
+  loadingTr.innerHTML = `<td colspan="${columns.length}">Loading…</td>`;
+  const ref = afterRow ? afterRow.nextSibling : null;
+  tbody.insertBefore(loadingTr, ref);
+
+  const params = new URLSearchParams({columns: columns.join(",")});
+  fetch(`/api/children/${encodeURIComponent(key)}?${params}`)
+    .then(r => r.json())
+    .then(data => {
+      const tickets = data.tickets || [];
+      CHILD_CACHE.set(key, tickets);
+      loadingTr.remove();
+      if (EXPANDED.has(key)) {
+        const parentRow = tbody.querySelector(`tr[data-key="${CSS.escape(key)}"]`);
+        insertChildRows(tbody, key, columns, tickets, parentRow);
+      }
+    })
+    .catch(() => { loadingTr.remove(); });
+}
+
+function insertChildRows(tbody, key, columns, tickets, afterRow) {
+  const frag = document.createDocumentFragment();
+  for (const t of tickets) {
+    const tr = document.createElement("tr");
+    tr.className = "child-row";
+    tr.dataset.parent = key;
+    tr.innerHTML = columns.map(c => `<td>${renderCell(t, c, false)}</td>`).join("");
+    frag.appendChild(tr);
+  }
+  const ref = afterRow ? afterRow.nextSibling : null;
+  tbody.insertBefore(frag, ref);
 }
 
 function sortValueFor(ticket, col) {
@@ -790,10 +929,13 @@ function sortValueFor(ticket, col) {
   return v.sort ?? v.display ?? "";
 }
 
-function renderCell(ticket, col) {
+function renderCell(ticket, col, expandable) {
   if (col === "key") {
     const url = `${STATE.jiraBase}/browse/${encodeURIComponent(ticket.key)}`;
-    return `<a class="key" href="${fmt(url)}" target="_blank" rel="noopener">${fmt(ticket.key)}</a>`;
+    const toggle = expandable
+      ? `<button class="expand-btn${EXPANDED.has(ticket.key) ? " open" : ""}" data-key="${fmt(ticket.key)}" title="Show child tickets">▶</button>`
+      : `<span style="display:inline-block;width:1.1rem"></span>`;
+    return toggle + `<a class="key" href="${fmt(url)}" target="_blank" rel="noopener">${fmt(ticket.key)}</a>`;
   }
   const v = ticket.values?.[col];
   if (!v || v.type === "empty") return "<span class='meta'>—</span>";
@@ -811,6 +953,10 @@ function renderValue(v) {
              (v.summary ? ` <span class="meta">${fmt(v.summary)}</span>` : "");
     case "list":
       return (v.items || []).map(i => `<span class="chip">${renderValue(i)}</span>`).join("");
+    case "date": {
+      const d = new Date(v.sort);
+      return isNaN(d) ? fmt(v.display) : `<span title="${fmt(v.sort)}">${fmt(d.toLocaleDateString(undefined, {year:"numeric",month:"short",day:"numeric"}))}</span>`;
+    }
     case "option":
       return fmt(v.display);
     default:

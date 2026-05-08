@@ -11,6 +11,7 @@ CONFIG_FILENAME = "mining_dashboard.config.json"
 DEFAULT_COLUMNS = [
     "key", "summary", "status", "assignee", "priority",
     "labels", "components", "parent",
+    "occurrence_count", "created", "updated",
 ]
 
 DEFAULT_JQL = (
@@ -84,6 +85,11 @@ class ConfigStore:
         for v in self._data["views"].values():
             for k, default in DEFAULT_VIEW.items():
                 v.setdefault(k, default if not isinstance(default, list) else list(default))
+            # Top up columns: append any new default columns not already present
+            existing = v["columns"]
+            for col in DEFAULT_COLUMNS:
+                if col not in existing:
+                    existing.append(col)
         self.save()
 
     def save(self) -> None:
