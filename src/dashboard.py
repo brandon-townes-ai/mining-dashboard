@@ -868,7 +868,35 @@ DASHBOARD_HTML = r"""<!doctype html>
     color: var(--muted);
     margin-bottom: 10px;
   }
-  .canvas-wrap { position: relative; height: 240px; }
+  .canvas-wrap { position: relative; height: 120px; }
+
+  .chart-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px 12px;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .chart-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    cursor: pointer;
+    transition: opacity var(--t);
+    user-select: none;
+  }
+  .chart-legend-item:hover { opacity: 0.75; }
+  .chart-legend-item.legend-hidden { opacity: 0.35; text-decoration: line-through; }
+  .chart-legend-swatch {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
 
   /* ─── TABLE ─────────────────────────────────────── */
   .table-wrap { overflow-x: auto; }
@@ -1552,22 +1580,26 @@ function renderCharts() {
     `<div class="card chart-card" data-col="${fmt(d.col)}">
       <h3>${fmt(d.title)}</h3>
       <div class="canvas-wrap"><canvas></canvas></div>
+      <div class="chart-legend"></div>
     </div>`).join("");
 
   for (const dim of present) {
     const agg = aggregateDim(dim);
     if (!agg.labels.length) continue;
-    const canvas = root.querySelector(`[data-col="${dim.col}"] canvas`);
+    const cardEl = root.querySelector(`[data-col="${dim.col}"]`);
+    const canvas = cardEl.querySelector("canvas");
+    const colors = colorsFor(dim, agg);
+
     const chart = new Chart(canvas, {
       type: "doughnut",
       data: {
         labels: agg.labels,
-        datasets: [{ data: agg.data, backgroundColor: colorsFor(dim, agg), borderWidth: 1 }],
+        datasets: [{ data: agg.data, backgroundColor: colors, borderWidth: 1 }],
       },
       options: {
         responsive: true, maintainAspectRatio: false,
         plugins: {
-          legend: { position: "bottom", labels: { boxWidth: 10, font: { size: 11 }, padding: 10 } },
+          legend: { display: false },
           tooltip: {
             callbacks: {
               label: ctx => {
@@ -1582,6 +1614,23 @@ function renderCharts() {
       },
     });
     CHART_INSTANCES.set(dim.col, chart);
+
+    // Custom HTML legend — wraps freely, never truncates, click to toggle slice
+    const legendEl = cardEl.querySelector(".chart-legend");
+    legendEl.innerHTML = agg.labels.map((label, i) =>
+      `<span class="chart-legend-item" data-idx="${i}">
+        <span class="chart-legend-swatch" style="background:${colors[i]}"></span>
+        ${fmt(label)}
+      </span>`
+    ).join("");
+    legendEl.querySelectorAll(".chart-legend-item").forEach(item => {
+      item.addEventListener("click", () => {
+        const idx = parseInt(item.dataset.idx, 10);
+        chart.toggleDataVisibility(idx);
+        chart.update();
+        item.classList.toggle("legend-hidden");
+      });
+    });
   }
 }
 
