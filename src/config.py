@@ -32,13 +32,21 @@ SEED_VIEWS: dict[str, dict] = {
     "VSTAB Off Road epics": dict(DEFAULT_VIEW),
     "Offroad Stack Issues": {
         **DEFAULT_VIEW,
-        "jql": "parent = EC-11955 ORDER BY status ASC",
+        "jql": 'parent in childIssuesOf("EC-11955") ORDER BY status ASC',
         "project_key": "EC",
     },
 }
 
 VIEW_RENAMES: dict[str, str] = {
     "EC-11955 children": "Offroad Stack Issues",
+}
+
+_OFFROAD_JQL = 'parent in childIssuesOf("EC-11955") ORDER BY status ASC'
+
+JQL_MIGRATIONS: dict[str, str] = {
+    "parent = EC-11955 ORDER BY status ASC": _OFFROAD_JQL,
+    "parent = EC-11955 AND issuetype = Bug ORDER BY status ASC": _OFFROAD_JQL,
+    "parent = EC-11955 AND issuetype = Task ORDER BY status ASC": _OFFROAD_JQL,
 }
 
 DEFAULT_CONFIG = {
@@ -86,6 +94,9 @@ class ConfigStore:
             self._data["views"] = {k: dict(v) for k, v in DEFAULT_CONFIG["views"].items()}
             freshly_seeded.update(self._data["views"].keys())
         self._data.setdefault("active_view", next(iter(self._data["views"])))
+        for v in self._data["views"].values():
+            if v.get("jql") in JQL_MIGRATIONS:
+                v["jql"] = JQL_MIGRATIONS[v["jql"]]
         for v_name, v in self._data["views"].items():
             for k, default in DEFAULT_VIEW.items():
                 v.setdefault(k, default if not isinstance(default, list) else list(default))
