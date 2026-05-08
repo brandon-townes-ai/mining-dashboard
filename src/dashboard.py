@@ -9,6 +9,7 @@ from flask import Flask, jsonify, render_template_string, request
 
 _STATIC_DIR = pathlib.Path(__file__).parent.parent / "static"
 
+
 from .config import APP_VERSION as _APP_VERSION, ConfigStore
 from .jira_client import JiraClient, JiraConfigError
 
