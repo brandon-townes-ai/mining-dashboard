@@ -6,7 +6,7 @@ from threading import RLock
 
 from flask import Flask, jsonify, render_template_string, request
 
-from .config import ConfigStore
+from .config import APP_VERSION as _APP_VERSION, ConfigStore
 from .jira_client import JiraClient, JiraConfigError
 
 
@@ -42,7 +42,7 @@ def create_app(store: ConfigStore) -> Flask:
 
     @app.get("/")
     def index():
-        version = os.environ.get("APP_VERSION", "1.0")
+        version = os.environ.get("APP_VERSION", _APP_VERSION)
         email = os.environ.get("JIRA_EMAIL", "")
         user_id = email.split("@")[0] if "@" in email else ""
         profile_url = (

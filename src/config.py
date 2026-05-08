@@ -6,6 +6,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
+APP_VERSION = "1.0.2"
+
 CONFIG_FILENAME = "mining_dashboard.config.json"
 
 DEFAULT_COLUMNS = [
