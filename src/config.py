@@ -77,19 +77,24 @@ class ConfigStore:
                 self._data["views"][new] = self._data["views"].pop(old)
                 if self._data.get("active_view") == old:
                     self._data["active_view"] = new
+        freshly_seeded: set[str] = set()
         for name, seed in SEED_VIEWS.items():
-            self._data["views"].setdefault(name, dict(seed))
+            if name not in self._data["views"]:
+                self._data["views"][name] = dict(seed)
+                freshly_seeded.add(name)
         if not self._data["views"]:
             self._data["views"] = {k: dict(v) for k, v in DEFAULT_CONFIG["views"].items()}
+            freshly_seeded.update(self._data["views"].keys())
         self._data.setdefault("active_view", next(iter(self._data["views"])))
-        for v in self._data["views"].values():
+        for v_name, v in self._data["views"].items():
             for k, default in DEFAULT_VIEW.items():
                 v.setdefault(k, default if not isinstance(default, list) else list(default))
-            # Top up columns: append any new default columns not already present
-            existing = v["columns"]
-            for col in DEFAULT_COLUMNS:
-                if col not in existing:
-                    existing.append(col)
+            # Only top-up DEFAULT_COLUMNS for views that were just created, not saved ones
+            if v_name in freshly_seeded:
+                existing = v["columns"]
+                for col in DEFAULT_COLUMNS:
+                    if col not in existing:
+                        existing.append(col)
         self.save()
 
     def save(self) -> None:
@@ -120,6 +125,8 @@ class ConfigStore:
         with self._lock:
             if name not in self._data["views"]:
                 return False
+            if name in SEED_VIEWS:
+                return False
             if len(self._data["views"]) == 1:
                 return False
             del self._data["views"][name]
@@ -145,4 +152,5 @@ class ConfigStore:
             return {
                 "active_view": self._data["active_view"],
                 "views": {k: dict(v) for k, v in self._data["views"].items()},
+                "protected_views": list(SEED_VIEWS.keys()),
             }
