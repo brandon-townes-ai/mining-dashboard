@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from threading import RLock
 
 from flask import Flask, jsonify, render_template_string, request
@@ -144,6 +145,7 @@ def create_app(store: ConfigStore) -> Flask:
         if mode == "jql":
             if not jql.strip():
                 return jsonify({"error": "JQL is empty"}), 400
+            jql = _resolve_jql(jql, client)
             issues = client.search_issues(jql, request_fields)
             tickets = [_shape_issue(i["key"], i.get("fields", {}), column_list, client.base_url)
                        for i in issues]
@@ -180,6 +182,25 @@ def create_app(store: ConfigStore) -> Flask:
         return jsonify({"jira_base_url": client.base_url, "columns": column_list, "tickets": tickets})
 
     return app
+
+
+def _resolve_jql(jql: str, client: JiraClient) -> str:
+    """Expand parent in childIssuesOf("KEY") into a concrete two-level parent in (...) query."""
+    m = re.match(
+        r'parent\s+in\s+childIssuesOf\(["\']?([A-Z]+-\d+)["\']?\)(.*)',
+        jql.strip(), re.IGNORECASE
+    )
+    if not m:
+        return jql
+    parent_key, rest = m.group(1), m.group(2).strip()
+    intermediate = client.search_issues(
+        f"parent = {parent_key}", ["summary"], max_results=200
+    )
+    if not intermediate:
+        return jql
+    keys_in = ", ".join(i["key"] for i in intermediate)
+    resolved = f"parent in ({keys_in})"
+    return f"{resolved} {rest}".strip() if rest else resolved
 
 
 SPECIAL_COLUMNS = {"key"}
@@ -599,10 +620,10 @@ DASHBOARD_HTML = r"""<!doctype html>
   .hero {
     background: var(--bg-card);
     border-bottom: 1px solid var(--border);
-    padding: 22px 24px 18px;
+    padding: 22px 24px 32px;
     flex-shrink: 0;
     position: relative;
-    overflow: hidden;
+    overflow: visible;
   }
   .hero::after {
     content: '';
@@ -618,7 +639,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     font-weight: 800;
     font-size: clamp(22px, 3vw, 36px);
     letter-spacing: -0.025em;
-    line-height: 1.1;
+    line-height: 1.3;
+    padding-bottom: 3px;
     color: var(--text);
     position: relative;
   }
@@ -680,6 +702,88 @@ DASHBOARD_HTML = r"""<!doctype html>
   .content::-webkit-scrollbar { width: 5px; }
   .content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
+  /* ─── ALERT BAR ─────────────────────────────────── */
+  .alert-bar {
+    background: #fffbeb;
+    border-bottom: 1px solid #fcd34d;
+    border-left: 4px solid #dc2626;
+    padding: 8px 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-shrink: 0;
+  }
+  [data-theme="dark"] .alert-bar { background: #1a1200; border-bottom-color: #78350f; }
+  [data-theme="dark"] .alert-item { background: #271d07; border-color: #78350f; }
+  [data-theme="dark"] .alert-bar-label { color: #fbbf24; }
+  [data-theme="dark"] .alert-dismiss { color: #fbbf24; }
+  .alert-bar.hidden { display: none; }
+  .alert-bar-label {
+    font-size: 10.5px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: #b45309;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .alert-items {
+    display: flex;
+    gap: 6px;
+    flex: 1;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+  }
+  .alert-items::-webkit-scrollbar { height: 3px; }
+  .alert-items::-webkit-scrollbar-thumb { background: #fcd34d; border-radius: 2px; }
+  .alert-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: #fff;
+    border: 1px solid #fde68a;
+    border-radius: var(--r-sm);
+    padding: 3px 8px;
+    font-size: 12px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: border-color var(--t);
+  }
+  .alert-item:hover { border-color: #f59e0b; }
+  .alert-priority-badge {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  .alert-priority-badge.p0 { background: #fee2e2; color: #991b1b; }
+  .alert-priority-badge.p1 { background: #ffedd5; color: #9a3412; }
+  .alert-key { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--accent); text-decoration: none; }
+  .alert-key:hover { text-decoration: underline; }
+  .alert-summary { max-width: 180px; overflow: hidden; text-overflow: ellipsis; color: var(--text-secondary); font-size: 12px; }
+  .alert-occ {
+    font-size: 10px;
+    font-weight: 700;
+    background: #dc2626;
+    color: #fff;
+    border-radius: 10px;
+    padding: 1px 6px;
+    flex-shrink: 0;
+  }
+  .alert-dismiss {
+    background: none;
+    border: none;
+    cursor: pointer;
+    color: #b45309;
+    font-size: 16px;
+    padding: 0 2px;
+    flex-shrink: 0;
+    line-height: 1;
+    opacity: 0.6;
+    transition: opacity var(--t);
+  }
+  .alert-dismiss:hover { opacity: 1; }
+
   /* ─── TOOLBAR ────────────────────────────────── */
   .toolbar {
     display: flex;
@@ -737,6 +841,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     flex-shrink: 0;
   }
   .btn-ghost:hover { background: var(--bg-hover); color: var(--text); }
+  .btn-ghost.active { background: var(--bg-hover); color: var(--text); border-color: var(--muted); font-weight: 600; }
 
   /* ─── CARD ─────────────────────────────────────── */
   .card {
@@ -1214,6 +1319,13 @@ DASHBOARD_HTML = r"""<!doctype html>
     </div>
   </div>
 
+  <!-- high sev alert bar -->
+  <div id="alert-bar" class="alert-bar hidden">
+    <span class="alert-bar-label">⚠ High Sev</span>
+    <div class="alert-items" id="alert-items"></div>
+    <button class="alert-dismiss" id="btn-alert-dismiss" title="Dismiss">×</button>
+  </div>
+
   <!-- scrollable content -->
   <div class="content">
 
@@ -1226,6 +1338,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <input type="text" id="query" class="toolbar-query" placeholder="JQL e.g. project = ADT ORDER BY updated DESC">
       <button id="btn-load" class="btn-primary">Load</button>
       <button id="btn-save-view" class="btn-ghost">Save view</button>
+      <button id="btn-hide-done" class="btn-ghost">Hide Done</button>
     </div>
 
     <!-- kpis -->
@@ -1317,7 +1430,56 @@ const STATE = {
   sortKey: null,
   sortDir: 1,
   refreshTimer: null,
+  hideDone: false,
 };
+
+function getVisibleTickets() {
+  if (!STATE.hideDone) return STATE.tickets;
+  return STATE.tickets.filter(t => (t.values?.status?.category ?? "") !== "done");
+}
+
+let alertBarDismissed = false;
+
+function renderAlertBar() {
+  if (alertBarDismissed) return;
+  const HIGH_PRIO = new Set(["p0", "p1"]);
+  const qualifying = getVisibleTickets().filter(t => {
+    if ((t.values?.status?.category ?? "") === "done") return false;
+    const prio = (t.values?.priority?.display || "").toLowerCase();
+    const occ = typeof t.values?.occurrence_count?.sort === "number"
+      ? t.values.occurrence_count.sort : 0;
+    return HIGH_PRIO.has(prio) || occ > 2;
+  });
+  const bar = $("#alert-bar");
+  if (!qualifying.length) { bar.classList.add("hidden"); return; }
+  bar.classList.remove("hidden");
+  const prio = t => (t.values?.priority?.display || "").toLowerCase();
+  const occ = t => typeof t.values?.occurrence_count?.sort === "number"
+    ? t.values.occurrence_count.sort : 0;
+  qualifying.sort((a, b) => {
+    const pa = prio(a), pb = prio(b);
+    if (pa !== pb) {
+      if (pa === "p0") return -1; if (pb === "p0") return 1;
+      if (pa === "p1") return -1; if (pb === "p1") return 1;
+    }
+    return occ(b) - occ(a);
+  });
+  $("#alert-items").innerHTML = qualifying.map(t => {
+    const p = prio(t);
+    const prioDisplay = fmt(t.values?.priority?.display || "");
+    const url = `${STATE.jiraBase}/browse/${encodeURIComponent(t.key)}`;
+    const occVal = occ(t);
+    const occBadge = occVal > 0 ? `<span class="alert-occ" title="Occurrences">${occVal}</span>` : "";
+    const priorityBadge = prioDisplay
+      ? `<span class="alert-priority-badge ${p}">${prioDisplay}</span>` : "";
+    return `<span class="alert-item">
+      ${priorityBadge}
+      <a class="alert-key" href="${fmt(url)}" target="_blank" rel="noopener">${fmt(t.key)}</a>
+      <span class="alert-summary" title="${fmt(t.summary)}">${fmt(t.summary)}</span>
+      ${occBadge}
+    </span>`;
+  }).join("");
+}
 
 function toast(msg, err=false) {
   const el = document.createElement("div");
@@ -1493,11 +1655,11 @@ const ACTION_STATUSES = [
 ];
 
 function renderKpis() {
-  const total = STATE.tickets.length;
+  const total = getVisibleTickets().length;
   let done = 0, inprog = 0, todo = 0, hasStatus = false;
   const actionCounts = new Map(ACTION_STATUSES.map(s => [s.match, 0]));
 
-  for (const t of STATE.tickets) {
+  for (const t of getVisibleTickets()) {
     const s = t.values?.status;
     if (!s || s.type === "empty") continue;
     hasStatus = true;
@@ -1534,7 +1696,7 @@ function renderKpis() {
 function aggregateDim(dim) {
   const counts = new Map();
   const meta = new Map();
-  for (const t of STATE.tickets) {
+  for (const t of getVisibleTickets()) {
     const v = t.values?.[dim.col];
     if (!v || v.type === "empty") {
       if (dim.col === "assignee") {
@@ -1658,9 +1820,11 @@ async function loadTickets() {
     STATE.jiraBase = data.jira_base_url;
     CHILD_CACHE.clear();
     EXPANDED.clear();
+    alertBarDismissed = false;
     renderKpis();
     renderCharts();
     renderTable();
+    renderAlertBar();
     $("#status").textContent = `${STATE.tickets.length} ticket(s) · ${new Date().toLocaleTimeString()}`;
     scheduleRefresh();
   } catch (e) {
@@ -1698,7 +1862,7 @@ function renderTable() {
     }
   });
 
-  const rows = [...STATE.tickets];
+  const rows = [...getVisibleTickets()];
   if (STATE.sortKey) {
     rows.sort((a, b) => {
       const av = sortValueFor(a, STATE.sortKey);
@@ -1958,6 +2122,20 @@ $("#btn-reload-fields").addEventListener("click", loadFields);
 $("#field-search").addEventListener("input", renderFieldPicker);
 $("#btn-sidebar-toggle").addEventListener("click", toggleSidebar);
 $("#btn-charts-toggle").addEventListener("click", toggleCharts);
+$("#btn-alert-dismiss").addEventListener("click", () => {
+  alertBarDismissed = true;
+  $("#alert-bar").classList.add("hidden");
+});
+$("#btn-hide-done").addEventListener("click", () => {
+  STATE.hideDone = !STATE.hideDone;
+  const btn = $("#btn-hide-done");
+  btn.classList.toggle("active", STATE.hideDone);
+  btn.textContent = STATE.hideDone ? "Show Done" : "Hide Done";
+  renderKpis();
+  renderCharts();
+  renderTable();
+  renderAlertBar();
+});
 $("#btn-theme").addEventListener("click", cycleTheme);
 
 applyTheme(getTheme());
