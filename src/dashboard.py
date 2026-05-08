@@ -787,6 +787,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   }
   .alert-dismiss:hover { opacity: 1; }
 
+
   /* ─── TOOLBAR ────────────────────────────────── */
   .toolbar {
     display: flex;
@@ -1328,6 +1329,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div class="alert-items" id="alert-items"></div>
     <button class="alert-dismiss" id="btn-alert-dismiss" title="Dismiss">×</button>
   </div>
+
 
   <!-- scrollable content -->
   <div class="content">
