@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 CONFIG_FILENAME = "mining_dashboard.config.json"
 

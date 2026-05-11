@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 import pathlib
 import re
+from datetime import datetime, timezone, timedelta
 from threading import RLock
 
 from flask import Flask, jsonify, render_template_string, request
 
 _STATIC_DIR = pathlib.Path(__file__).parent.parent / "static"
+
 
 from .config import APP_VERSION as _APP_VERSION, ConfigStore
 from .jira_client import JiraClient, JiraConfigError
@@ -127,6 +129,47 @@ def create_app(store: ConfigStore) -> Flask:
                    for i in issues]
         return jsonify({"jira_base_url": client.base_url, "columns": column_list, "tickets": tickets})
 
+    @app.get("/api/stale-children")
+    def api_stale_children():
+        view_name = request.args.get("view") or store.get_active()
+        view = store.get_view(view_name)
+        if not view:
+            return jsonify({"stale": [], "jira_base_url": ""})
+        client = holder.get()
+        mode = view["mode"]
+        if mode == "jql":
+            jql = view.get("jql", "").strip()
+            if not jql:
+                return jsonify({"stale": [], "jira_base_url": client.base_url})
+            jql = _resolve_jql(jql, client)
+            parent_issues = client.search_issues(jql, ["summary"], max_results=100)
+        else:
+            parent_issues = [{"key": k, "fields": {"summary": ""}} for k in (view.get("keys") or [])]
+        if not parent_issues:
+            return jsonify({"stale": [], "jira_base_url": client.base_url})
+        parent_keys_in = ", ".join(i["key"] for i in parent_issues)
+        parent_summary = {i["key"]: (i.get("fields") or {}).get("summary", "") for i in parent_issues}
+        child_fields = ["summary", "status", "updated", "parent", "priority", "assignee"]
+        children = client.search_issues(
+            f"parent in ({parent_keys_in}) ORDER BY updated ASC", child_fields, max_results=500
+        )
+        stale = []
+        for c in children:
+            fields = c.get("fields") or {}
+            if _is_stale(fields):
+                parent_key = (fields.get("parent") or {}).get("key", "")
+                stale.append({
+                    "key": c["key"],
+                    "summary": fields.get("summary") or "",
+                    "updated": fields.get("updated") or "",
+                    "status": (fields.get("status") or {}).get("name", ""),
+                    "priority": (fields.get("priority") or {}).get("name", ""),
+                    "assignee": (fields.get("assignee") or {}).get("displayName", ""),
+                    "parent_key": parent_key,
+                    "parent_summary": parent_summary.get(parent_key, ""),
+                })
+        return jsonify({"stale": stale, "jira_base_url": client.base_url})
+
     @app.get("/api/tickets")
     def api_tickets():
         view_name = request.args.get("view") or store.get_active()
@@ -211,13 +254,35 @@ COLUMN_TO_FIELD = {"epic": "parent", "occurrence_count": "subtasks"}
 
 
 def _expand_request_fields(columns: list[str]) -> list[str]:
-    fields: set[str] = set()
+    fields: set[str] = {"updated", "status"}
     for c in columns:
         if c in SPECIAL_COLUMNS:
             continue
         fields.add(COLUMN_TO_FIELD.get(c, c))
     fields.add("summary")
     return sorted(fields)
+
+
+_STALE_THRESHOLD = timedelta(hours=24)
+_STALE_EXCLUDE_NAMES = {"blocked", "containment"}
+
+
+def _is_stale(fields: dict) -> bool:
+    status = fields.get("status") or {}
+    category = (status.get("statusCategory") or {}).get("key", "")
+    name = (status.get("name") or "").lower()
+    if category == "done" or name in _STALE_EXCLUDE_NAMES:
+        return False
+    updated_str = fields.get("updated")
+    if not updated_str:
+        return False
+    try:
+        ts = re.sub(r"\.\d+", "", updated_str).replace("Z", "+00:00")
+        ts = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", ts)
+        updated = datetime.fromisoformat(ts)
+        return datetime.now(timezone.utc) - updated > _STALE_THRESHOLD
+    except (ValueError, TypeError):
+        return False
 
 
 def _shape_issue(key: str, fields: dict, columns: list[str], base_url: str) -> dict:
@@ -227,7 +292,8 @@ def _shape_issue(key: str, fields: dict, columns: list[str], base_url: str) -> d
             continue
         field_id = COLUMN_TO_FIELD.get(col, col)
         values[col] = _render_field(field_id, fields.get(field_id), base_url)
-    return {"key": key, "summary": fields.get("summary") or "", "values": values}
+    return {"key": key, "summary": fields.get("summary") or "", "values": values,
+            "is_stale": _is_stale(fields)}
 
 
 def _render_field(field_id: str, raw, base_url: str):
@@ -759,8 +825,11 @@ DASHBOARD_HTML = r"""<!doctype html>
     padding: 1px 5px;
     border-radius: 3px;
   }
-  .alert-priority-badge.p0 { background: #fee2e2; color: #991b1b; }
-  .alert-priority-badge.p1 { background: #ffedd5; color: #9a3412; }
+  .alert-priority-badge.p0, .alert-priority-badge.critical  { background: #fee2e2; color: #991b1b; }
+  .alert-priority-badge.p1, .alert-priority-badge.high      { background: #ffedd5; color: #9a3412; }
+  .alert-priority-badge.p2, .alert-priority-badge.medium    { background: #dbeafe; color: #1e40af; }
+  .alert-priority-badge.p3, .alert-priority-badge.low       { background: #f0fdf4; color: #166534; }
+  .alert-priority-badge.p4, .alert-priority-badge.lowest    { background: var(--bg-subtle); color: var(--muted); }
   .alert-key { font-family: 'DM Mono', monospace; font-size: 11px; color: var(--accent); text-decoration: none; }
   .alert-key:hover { text-decoration: underline; }
   .alert-summary { max-width: 180px; overflow: hidden; text-overflow: ellipsis; color: var(--text-secondary); font-size: 12px; }
@@ -786,6 +855,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     transition: opacity var(--t);
   }
   .alert-dismiss:hover { opacity: 1; }
+
 
   /* ─── TOOLBAR ────────────────────────────────── */
   .toolbar {
@@ -887,6 +957,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .kpi.waiting::before     { background: var(--waiting); }
   .kpi.containment::before { background: var(--containment); }
   .kpi.corrective::before  { background: var(--corrective); }
+  .kpi.stale::before       { background: var(--warn); }
 
   .kpi-label {
     font-size: 9.5px;
@@ -914,6 +985,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .kpi.containment .kpi-value { color: var(--containment); }
   .kpi.corrective .kpi-value  { color: var(--corrective); }
   .kpi.waiting .kpi-value     { color: var(--waiting); }
+  .kpi.stale .kpi-value       { color: var(--warn); }
 
   .kpi-sub {
     font-size: 10.5px;
@@ -1049,6 +1121,149 @@ DASHBOARD_HTML = r"""<!doctype html>
   tr.child-row td:first-child { padding-left: 2.4rem; }
   tr.child-row:hover td { background: var(--bg-hover); }
   tr.child-loading td { color: var(--muted); font-size: 12px; padding-left: 2.4rem; }
+
+  /* ─── STALE HIGHLIGHTING ────────────────────────────── */
+  tr.stale td                    { background: rgba(250,144,5,0.08); }
+  tr.stale td:first-child        { box-shadow: inset 3px 0 0 var(--warn); }
+  tr.stale:hover td              { background: rgba(250,144,5,0.14); }
+  tr.child-row.stale td          { background: rgba(250,144,5,0.10); }
+  tr.child-row.stale td:first-child { box-shadow: inset 3px 0 0 var(--warn); }
+  tr.child-row.stale:hover td    { background: rgba(250,144,5,0.18); }
+  .stale-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 999px;
+    font-size: 10px;
+    font-weight: 700;
+    background: rgba(250,144,5,0.15);
+    color: var(--warn);
+    margin-left: 5px;
+    vertical-align: middle;
+    letter-spacing: 0.04em;
+  }
+
+  /* ─── STALE CALLOUT SECTION ─────────────────────── */
+  .stale-callout {
+    position: relative;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    box-shadow: var(--shadow-sm);
+    margin-bottom: 14px;
+    overflow: hidden;
+  }
+  .stale-callout::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 3px;
+    background: var(--warn);
+    border-radius: var(--r) 0 0 var(--r);
+  }
+  .stale-callout-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 14px 10px 18px;
+    cursor: pointer;
+    user-select: none;
+    transition: background var(--t);
+  }
+  .stale-callout-header:hover { background: var(--bg-subtle); }
+  .stale-callout-dot {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--warn);
+    flex-shrink: 0;
+  }
+  .stale-callout-title {
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+    color: var(--warn);
+    white-space: nowrap;
+  }
+  .stale-callout-count {
+    font-family: 'Syne', sans-serif;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--warn);
+    background: rgba(250,144,5,0.12);
+    padding: 1px 7px;
+    border-radius: 999px;
+    flex-shrink: 0;
+  }
+  .stale-callout-desc {
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .stale-callout-line { flex: 1; height: 1px; background: var(--border); }
+  .stale-callout-icon {
+    font-size: 13px;
+    color: var(--muted);
+    transition: transform var(--t);
+    flex-shrink: 0;
+  }
+  .stale-callout-icon.collapsed { transform: rotate(-90deg); }
+  .stale-callout-body { padding: 0 14px 8px 18px; }
+  .stale-callout-body.hidden { display: none; }
+
+  .stale-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 5px 0;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .stale-item:last-child { border-bottom: none; }
+  .stale-idle-tag {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--warn);
+    background: rgba(250,144,5,0.12);
+    padding: 2px 6px;
+    border-radius: 4px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    min-width: 56px;
+    text-align: center;
+  }
+  .stale-item-key {
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    color: var(--accent);
+    text-decoration: none;
+    flex-shrink: 0;
+  }
+  .stale-item-key:hover { text-decoration: underline; }
+  .stale-item-summary {
+    font-size: 12px;
+    color: var(--text);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .stale-parent-chip {
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    color: var(--text-secondary);
+    background: var(--bg-subtle);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    padding: 1px 6px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .stale-assignee {
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
 
   a.key {
     color: var(--accent);
@@ -1329,8 +1544,35 @@ DASHBOARD_HTML = r"""<!doctype html>
     <button class="alert-dismiss" id="btn-alert-dismiss" title="Dismiss">×</button>
   </div>
 
+
   <!-- scrollable content -->
   <div class="content">
+
+    <!-- stale children callout -->
+    <div class="stale-callout hidden" id="stale-callout">
+      <div class="stale-callout-header" id="stale-callout-toggle">
+        <span class="stale-callout-dot"></span>
+        <span class="stale-callout-title">Stale Issues</span>
+        <span class="stale-callout-count" id="stale-callout-count">0</span>
+        <span class="stale-callout-desc">child issues without activity for 24h+</span>
+        <span class="stale-callout-line"></span>
+        <span class="stale-callout-icon" id="stale-callout-icon">▾</span>
+      </div>
+      <div class="stale-callout-body" id="stale-callout-body"></div>
+    </div>
+
+    <!-- charts collapsible -->
+    <div class="charts-section" id="charts-section">
+      <button class="charts-toggle" id="btn-charts-toggle">
+        <span>Charts</span>
+        <span class="charts-toggle-line"></span>
+        <span class="charts-icon" id="charts-icon">▾</span>
+      </button>
+      <div class="charts" id="charts"></div>
+    </div>
+
+    <!-- kpis -->
+    <div class="kpis" id="kpis"></div>
 
     <!-- toolbar -->
     <div class="toolbar card">
@@ -1342,19 +1584,6 @@ DASHBOARD_HTML = r"""<!doctype html>
       <button id="btn-load" class="btn-primary">Load</button>
       <button id="btn-save-view" class="btn-ghost">Save view</button>
       <button id="btn-hide-done" class="btn-ghost">Hide Done</button>
-    </div>
-
-    <!-- kpis -->
-    <div class="kpis" id="kpis"></div>
-
-    <!-- charts collapsible -->
-    <div class="charts-section" id="charts-section">
-      <button class="charts-toggle" id="btn-charts-toggle">
-        <span>Charts</span>
-        <span class="charts-toggle-line"></span>
-        <span class="charts-icon" id="charts-icon">▾</span>
-      </button>
-      <div class="charts" id="charts"></div>
     </div>
 
     <!-- table -->
@@ -1680,8 +1909,11 @@ function renderKpis() {
     .map(as => ({ cls: as.cls, label: as.label, value: actionCounts.get(as.match), sub: pct(actionCounts.get(as.match)) }))
     .filter(t => t.value > 0);
 
+  const staleCount = getVisibleTickets().filter(t => t.is_stale).length;
+
   const tiles = [
     {label: "Total", value: total, sub: "tickets"},
+    staleCount > 0 && {cls: "stale", label: "Stale", value: staleCount, sub: ">24h inactive"},
     hasStatus && {cls: "done",   label: "Done",        value: done,   sub: pct(done)},
     hasStatus && {cls: "inprog", label: "In Progress",  value: inprog, sub: pct(inprog)},
     hasStatus && {cls: "todo",   label: "To Do",        value: todo,   sub: pct(todo)},
@@ -1819,6 +2051,7 @@ async function loadTickets() {
   try {
     const data = await api("/api/tickets?" + params.toString());
     STATE.tickets = data.tickets;
+    STATE.tickets.forEach(t => { t.is_stale = false; });
     STATE.columns = data.columns;
     STATE.jiraBase = data.jira_base_url;
     CHILD_CACHE.clear();
@@ -1828,6 +2061,7 @@ async function loadTickets() {
     renderCharts();
     renderTable();
     renderAlertBar();
+    loadStaleChildren();
     $("#status").textContent = `${STATE.tickets.length} ticket(s) · ${new Date().toLocaleTimeString()}`;
     scheduleRefresh();
   } catch (e) {
@@ -1838,6 +2072,50 @@ async function loadTickets() {
       $("#status").innerHTML = `<span class="err">${fmt(e.message)}</span>`;
     }
   }
+}
+
+function idleLabel(updatedStr) {
+  if (!updatedStr) return "—";
+  const hrs = Math.round((Date.now() - new Date(updatedStr).getTime()) / 3600000);
+  if (hrs < 24) return `${hrs}h idle`;
+  const d = Math.floor(hrs / 24), h = hrs % 24;
+  return h ? `${d}d ${h}h idle` : `${d}d idle`;
+}
+
+async function loadStaleChildren() {
+  const params = new URLSearchParams({view: STATE.workingViewName});
+  try {
+    const data = await api("/api/stale-children?" + params.toString());
+    renderStaleCallout(data.stale || [], data.jira_base_url || STATE.jiraBase);
+  } catch (_) { /* non-critical */ }
+}
+
+function renderStaleCallout(items, jiraBase) {
+  const el = $("#stale-callout");
+  if (!items.length) { el.classList.add("hidden"); return; }
+  el.classList.remove("hidden");
+  $("#stale-callout-count").textContent = items.length;
+  $("#stale-callout-body").innerHTML = items.map(item => {
+    const url = `${jiraBase}/browse/${encodeURIComponent(item.key)}`;
+    const prioClass = (item.priority || "").toLowerCase().replace(/\s+/g, "-");
+    const prioBadge = item.priority
+      ? `<span class="alert-priority-badge ${fmt(prioClass)}">${fmt(item.priority)}</span>`
+      : "";
+    const assignee = item.assignee
+      ? `<span class="stale-assignee">↳ ${fmt(item.assignee)}</span>`
+      : `<span class="stale-assignee" style="color:var(--muted)">↳ Unassigned</span>`;
+    const parent = item.parent_key
+      ? `<span class="stale-parent-chip" title="${fmt(item.parent_summary)}">${fmt(item.parent_key)}</span>`
+      : "";
+    return `<div class="stale-item">
+      <span class="stale-idle-tag">${fmt(idleLabel(item.updated))}</span>
+      ${prioBadge}
+      <a class="stale-item-key" href="${fmt(url)}" target="_blank" rel="noopener">${fmt(item.key)}</a>
+      <span class="stale-item-summary" title="${fmt(item.summary)}">${fmt(item.summary)}</span>
+      ${assignee}
+      ${parent}
+    </div>`;
+  }).join("");
 }
 
 function scheduleRefresh() {
@@ -1880,6 +2158,7 @@ function renderTable() {
   for (const t of rows) {
     const tr = document.createElement("tr");
     tr.dataset.key = t.key;
+    if (t.is_stale) tr.classList.add("stale");
     tr.innerHTML = STATE.columns.map(c => `<td>${renderCell(t, c, !!t.has_children)}</td>`).join("");
     tbody.appendChild(tr);
 
@@ -1938,6 +2217,7 @@ function insertChildRows(tbody, key, columns, tickets, afterRow) {
   for (const t of tickets) {
     const tr = document.createElement("tr");
     tr.className = "child-row";
+    if (t.is_stale) tr.classList.add("stale");
     tr.dataset.parent = key;
     tr.innerHTML = columns.map(c => `<td>${renderCell(t, c, false)}</td>`).join("");
     frag.appendChild(tr);
@@ -1959,7 +2239,8 @@ function renderCell(ticket, col, expandable) {
     const toggle = expandable
       ? `<button class="expand-btn${EXPANDED.has(ticket.key) ? " open" : ""}" data-key="${fmt(ticket.key)}" title="Show child tickets">▶</button>`
       : `<span style="display:inline-block;width:1.1rem"></span>`;
-    return toggle + `<a class="key" href="${fmt(url)}" target="_blank" rel="noopener">${fmt(ticket.key)}</a>`;
+    const staleBadge = ticket.is_stale ? `<span class="stale-badge">Stale</span>` : "";
+    return toggle + `<a class="key" href="${fmt(url)}" target="_blank" rel="noopener">${fmt(ticket.key)}</a>` + staleBadge;
   }
   const v = ticket.values?.[col];
   if (!v || v.type === "empty") return "<span class='meta'>—</span>";
@@ -2089,6 +2370,14 @@ function toggleCharts() {
   $("#charts-icon").classList.toggle("collapsed", chartsCollapsed);
 }
 
+// Stale callout collapse toggle
+let staleCalloutCollapsed = false;
+function toggleStaleCallout() {
+  staleCalloutCollapsed = !staleCalloutCollapsed;
+  $("#stale-callout-body").classList.toggle("hidden", staleCalloutCollapsed);
+  $("#stale-callout-icon").classList.toggle("collapsed", staleCalloutCollapsed);
+}
+
 // Theme
 function getTheme() {
   const stored = localStorage.getItem("theme");
@@ -2125,6 +2414,7 @@ $("#btn-reload-fields").addEventListener("click", loadFields);
 $("#field-search").addEventListener("input", renderFieldPicker);
 $("#btn-sidebar-toggle").addEventListener("click", toggleSidebar);
 $("#btn-charts-toggle").addEventListener("click", toggleCharts);
+$("#stale-callout-toggle").addEventListener("click", toggleStaleCallout);
 $("#btn-alert-dismiss").addEventListener("click", () => {
   alertBarDismissed = true;
   $("#alert-bar").classList.add("hidden");
