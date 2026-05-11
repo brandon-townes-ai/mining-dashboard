@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import re
 from threading import RLock
 
 from flask import Flask, jsonify, render_template_string, request
+
+_STATIC_DIR = pathlib.Path(__file__).parent.parent / "static"
 
 from .config import APP_VERSION as _APP_VERSION, ConfigStore
 from .jira_client import JiraClient, JiraConfigError
@@ -29,7 +32,7 @@ class ClientHolder:
 
 
 def create_app(store: ConfigStore) -> Flask:
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder=str(_STATIC_DIR))
     holder = ClientHolder()
 
     @app.errorhandler(JiraConfigError)
