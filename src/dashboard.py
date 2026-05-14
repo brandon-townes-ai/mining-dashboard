@@ -142,13 +142,18 @@ def create_app(store: ConfigStore) -> Flask:
             if not jql:
                 return jsonify({"stale": [], "jira_base_url": client.base_url})
             jql = _resolve_jql(jql, client)
-            parent_issues = client.search_issues(jql, ["summary"], max_results=100)
+            parent_issues = client.search_issues(jql, ["summary", "issuetype"], max_results=100)
         else:
             parent_issues = [{"key": k, "fields": {"summary": ""}} for k in (view.get("keys") or [])]
         if not parent_issues:
             return jsonify({"stale": [], "jira_base_url": client.base_url})
-        parent_keys_in = ", ".join(i["key"] for i in parent_issues)
-        parent_summary = {i["key"]: (i.get("fields") or {}).get("summary", "") for i in parent_issues}
+        # Only fetch children of epics — non-epic top-level tickets appear directly in the table
+        epic_issues = [i for i in parent_issues
+                       if (i.get("fields") or {}).get("issuetype", {}).get("name", "").lower() == "epic"]
+        if not epic_issues:
+            return jsonify({"stale": [], "jira_base_url": client.base_url})
+        parent_keys_in = ", ".join(i["key"] for i in epic_issues)
+        parent_summary = {i["key"]: (i.get("fields") or {}).get("summary", "") for i in epic_issues}
         child_fields = ["summary", "status", "updated", "parent", "priority", "assignee"]
         children = client.search_issues(
             f"parent in ({parent_keys_in}) ORDER BY updated ASC", child_fields, max_results=500
@@ -195,6 +200,36 @@ def create_app(store: ConfigStore) -> Flask:
             issues = client.search_issues(jql, request_fields)
             tickets = [_shape_issue(i["key"], i.get("fields", {}), column_list, client.base_url)
                        for i in issues]
+            # Also fetch child epics one level down (sub-epics of the returned epics)
+            level1_epic_keys = [i["key"] for i in issues
+                                if (i.get("fields") or {}).get("issuetype", {}).get("name", "").lower() == "epic"]
+            if level1_epic_keys:
+                try:
+                    keys_in = ", ".join(level1_epic_keys)
+                    child_epic_issues = client.search_issues(
+                        f"issuetype = Epic AND parent in ({keys_in})", request_fields
+                    )
+                    existing_keys = {t["key"] for t in tickets}
+                    for ci in child_epic_issues:
+                        if ci["key"] not in existing_keys:
+                            tickets.append(_shape_issue(ci["key"], ci.get("fields", {}), column_list, client.base_url))
+                except Exception:
+                    pass
+            # Also fetch parent epics one level up (the containers that hold the returned epics)
+            parent_keys = {t.get("parent_key") for t in tickets if t.get("parent_key")}
+            existing_keys = {t["key"] for t in tickets}
+            parent_keys -= existing_keys
+            if parent_keys:
+                try:
+                    keys_in = ", ".join(parent_keys)
+                    parent_epic_issues = client.search_issues(
+                        f"issuetype = Epic AND key in ({keys_in})", request_fields
+                    )
+                    for pi in parent_epic_issues:
+                        if pi["key"] not in existing_keys:
+                            tickets.append(_shape_issue(pi["key"], pi.get("fields", {}), column_list, client.base_url))
+                except Exception:
+                    pass
         else:
             keylist = [k.strip() for k in keys.replace(",", " ").split() if k.strip()]
             if not keylist:
@@ -207,6 +242,13 @@ def create_app(store: ConfigStore) -> Flask:
                 except (ValueError, JiraConfigError) as exc:
                     tickets.append({"key": k, "_error": str(exc),
                                     "summary": str(exc), "values": {}})
+        # Deduplicate: drop non-epic tickets whose parent is also in the result (prevents double-rendering
+        # child issues that appear both standalone and as expanded children). Epics are always kept
+        # even if nested, since sub-epics are intentionally included at the top level.
+        top_level_keys = {t["key"] for t in tickets}
+        tickets = [t for t in tickets
+                   if t.get("is_epic") or not t.get("parent_key") or t["parent_key"] not in top_level_keys]
+
         # One batch query to find which tickets have children
         keys_with_children: set[str] = set()
         if tickets:
@@ -254,7 +296,7 @@ COLUMN_TO_FIELD = {"epic": "parent", "occurrence_count": "subtasks"}
 
 
 def _expand_request_fields(columns: list[str]) -> list[str]:
-    fields: set[str] = {"updated", "status"}
+    fields: set[str] = {"updated", "status", "issuetype", "parent"}
     for c in columns:
         if c in SPECIAL_COLUMNS:
             continue
@@ -293,7 +335,9 @@ def _shape_issue(key: str, fields: dict, columns: list[str], base_url: str) -> d
         field_id = COLUMN_TO_FIELD.get(col, col)
         values[col] = _render_field(field_id, fields.get(field_id), base_url)
     return {"key": key, "summary": fields.get("summary") or "", "values": values,
-            "is_stale": _is_stale(fields)}
+            "is_stale": _is_stale(fields),
+            "is_epic": (fields.get("issuetype") or {}).get("name", "").lower() == "epic",
+            "parent_key": (fields.get("parent") or {}).get("key", "")}
 
 
 def _render_field(field_id: str, raw, base_url: str):
@@ -2051,7 +2095,7 @@ async function loadTickets() {
   try {
     const data = await api("/api/tickets?" + params.toString());
     STATE.tickets = data.tickets;
-    STATE.tickets.forEach(t => { t.is_stale = false; });
+    STATE.tickets.forEach(t => { if (t.is_epic) t.is_stale = false; });
     STATE.columns = data.columns;
     STATE.jiraBase = data.jira_base_url;
     CHILD_CACHE.clear();

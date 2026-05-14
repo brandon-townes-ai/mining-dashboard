@@ -17,8 +17,12 @@ DEFAULT_COLUMNS = [
 ]
 
 DEFAULT_JQL = (
-    'project = VSTAB AND type = "Epic" AND component = "Off Road" '
+    'project = VSTAB AND issuetype = "Epic" AND component = "Off Road" '
     'ORDER BY status ASC'
+)
+
+_ALL_VEHICLES_JQL = (
+    'issuetype = "Epic" AND component = "Off Road" ORDER BY Rank'
 )
 
 DEFAULT_VIEW = {
@@ -32,6 +36,10 @@ DEFAULT_VIEW = {
 
 SEED_VIEWS: dict[str, dict] = {
     "VSTAB Off Road epics": dict(DEFAULT_VIEW),
+    "VSTAB All Vehicles": {
+        **DEFAULT_VIEW,
+        "jql": _ALL_VEHICLES_JQL,
+    },
     "Offroad Stack Issues": {
         **DEFAULT_VIEW,
         "jql": 'parent in childIssuesOf("EC-11955") ORDER BY status ASC',
@@ -41,14 +49,21 @@ SEED_VIEWS: dict[str, dict] = {
 
 VIEW_RENAMES: dict[str, str] = {
     "EC-11955 children": "Offroad Stack Issues",
+    "VSTAB Off Road": "VSTAB Off Road epics",
 }
 
 _OFFROAD_JQL = 'parent in childIssuesOf("EC-11955") ORDER BY status ASC'
-
 JQL_MIGRATIONS: dict[str, str] = {
     "parent = EC-11955 ORDER BY status ASC": _OFFROAD_JQL,
     "parent = EC-11955 AND issuetype = Bug ORDER BY status ASC": _OFFROAD_JQL,
     "parent = EC-11955 AND issuetype = Task ORDER BY status ASC": _OFFROAD_JQL,
+    # All previous VSTAB Off Road epic query variants → current locked form
+    'project = VSTAB AND type = "Epic" AND component = "Off Road" ORDER BY status ASC': DEFAULT_JQL,
+    'project = VSTAB AND component = "Off Road" ORDER BY status ASC': DEFAULT_JQL,
+    'project = VSTAB AND issuetype = Epic AND component = "Off Road" ORDER BY status ASC': DEFAULT_JQL,
+    # Previous combined queries → All Vehicles view JQL
+    '(project = VSTAB AND issuetype = Epic AND component = "Off Road") OR (project = 10890 AND issuetype = Epic) ORDER BY Rank': _ALL_VEHICLES_JQL,
+    'project = 10890 AND issuetype = Epic ORDER BY Rank': _ALL_VEHICLES_JQL,
 }
 
 DEFAULT_CONFIG = {
