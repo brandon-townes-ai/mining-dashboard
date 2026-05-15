@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 CONFIG_FILENAME = "mining_dashboard.config.json"
 
@@ -34,6 +34,12 @@ DEFAULT_VIEW = {
     "project_key": "VSTAB",
 }
 
+_OFFROAD_JQL = (
+    'project = EC AND type = Bug AND "stack[checkboxes]" = mine_autonomy '
+    'AND status NOT IN (Declined, "Unable to Reproduce", Resolved) '
+    'ORDER BY priority DESC, created DESC'
+)
+
 SEED_VIEWS: dict[str, dict] = {
     "VSTAB Off Road epics": dict(DEFAULT_VIEW),
     "VSTAB All Vehicles": {
@@ -42,7 +48,7 @@ SEED_VIEWS: dict[str, dict] = {
     },
     "Offroad Stack Issues": {
         **DEFAULT_VIEW,
-        "jql": 'parent in childIssuesOf("EC-11955") ORDER BY status ASC',
+        "jql": _OFFROAD_JQL,
         "project_key": "EC",
     },
 }

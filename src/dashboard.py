@@ -2257,8 +2257,11 @@ function appendChildRows(tbody, key, columns, afterRow) {
 }
 
 function insertChildRows(tbody, key, columns, tickets, afterRow) {
+  const visible = STATE.hideDone
+    ? tickets.filter(t => (t.values?.status?.category ?? "") !== "done")
+    : tickets;
   const frag = document.createDocumentFragment();
-  for (const t of tickets) {
+  for (const t of visible) {
     const tr = document.createElement("tr");
     tr.className = "child-row";
     if (t.is_stale) tr.classList.add("stale");
