@@ -1208,6 +1208,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   }
   .stale-callout-icon.collapsed { transform: rotate(-90deg); }
   .stale-callout-body { padding: 0 14px 8px 18px; }
+  .stale-callout.hidden { display: none; }
   .stale-callout-body.hidden { display: none; }
 
   .stale-item {
@@ -2032,6 +2033,7 @@ function renderCharts() {
 }
 
 async function loadTickets() {
+  renderStaleCallout([], STATE.jiraBase);
   STATE.workingView.mode = $("#mode-select").value;
   const q = $("#query").value.trim();
   if (STATE.workingView.mode === "jql") {
@@ -2082,12 +2084,18 @@ function idleLabel(updatedStr) {
   return h ? `${d}d ${h}h idle` : `${d}d idle`;
 }
 
+let _latestStaleView = null;
 async function loadStaleChildren() {
-  const params = new URLSearchParams({view: STATE.workingViewName});
+  const viewName = STATE.workingViewName;
+  _latestStaleView = viewName;
+  const params = new URLSearchParams({view: viewName});
   try {
     const data = await api("/api/stale-children?" + params.toString());
+    if (_latestStaleView !== viewName) return;
     renderStaleCallout(data.stale || [], data.jira_base_url || STATE.jiraBase);
-  } catch (_) { /* non-critical */ }
+  } catch (_) {
+    if (_latestStaleView === viewName) renderStaleCallout([], STATE.jiraBase);
+  }
 }
 
 function renderStaleCallout(items, jiraBase) {
