@@ -614,6 +614,10 @@ DASHBOARD_HTML = r"""<!doctype html>
     color: var(--sb-footer-text);
     white-space: nowrap;
     font-family: 'DM Mono', monospace;
+    text-decoration: none;
+  }
+  .sidebar-footer-meta:hover {
+    text-decoration: underline;
   }
 
   /* ═══ MAIN ═══════════════════════════════════════════════════════ */
@@ -1509,7 +1513,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <button class="sidebar-new-view" id="btn-new-view">+ New view</button>
   </div>
   <div class="sidebar-footer">
-    <span class="sidebar-footer-meta">v{{ version }}</span>
+    <a class="sidebar-footer-meta" href="https://github.com/brandon-townes-ai/mining-dashboard" target="_blank" rel="noopener noreferrer">v{{ version }}</a>
   </div>
 </div>
 
