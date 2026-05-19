@@ -75,3 +75,29 @@ class JiraClient:
 
     def verify_auth(self) -> dict:
         return self._get("myself")  # type: ignore[return-value]
+
+    def _post(self, path: str, payload: dict) -> dict:
+        url = self._url(path)
+        self._log(f"POST {url}")
+        resp = self._session.post(url, json=payload)
+        if resp.status_code == 400:
+            raise ValueError(f"Jira rejected request: {resp.text[:300]}")
+        if resp.status_code == 401:
+            raise JiraConfigError("Jira auth failed (401) — check email and API token.")
+        if resp.status_code == 403:
+            raise JiraConfigError("Jira permission denied (403).")
+        if resp.status_code == 404:
+            raise ValueError(f"Not found: {path}")
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
+
+    def get_comments(self, issue_key: str, max_results: int = 50) -> list[dict]:
+        data = self._get(f"issue/{issue_key}/comment", maxResults=max_results, orderBy="-created")
+        return data.get("comments", [])
+
+    def add_comment(self, issue_key: str, text: str) -> dict:
+        adf = {
+            "version": 1, "type": "doc",
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}],
+        }
+        return self._post(f"issue/{issue_key}/comment", {"body": adf})

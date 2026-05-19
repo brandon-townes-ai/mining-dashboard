@@ -129,6 +129,54 @@ def create_app(store: ConfigStore) -> Flask:
                    for i in issues]
         return jsonify({"jira_base_url": client.base_url, "columns": column_list, "tickets": tickets})
 
+    @app.get("/api/ticket/<issue_key>")
+    def api_ticket_detail(issue_key: str):
+        client = holder.get()
+        detail_fields = [
+            "summary", "status", "assignee", "priority", "labels",
+            "components", "parent", "created", "updated",
+            "customfield_14138", "customfield_10212",
+            "customfield_10210", "customfield_13420",
+        ]
+        fields = client.get_issue_fields(issue_key, detail_fields)
+        values = {}
+        for fid in detail_fields:
+            if fid == "summary":
+                continue
+            values[fid] = _render_field(fid, fields.get(fid), client.base_url)
+        return jsonify({
+            "key": issue_key,
+            "summary": fields.get("summary") or "",
+            "jira_base_url": client.base_url,
+            "values": values,
+        })
+
+    @app.get("/api/ticket/<issue_key>/comments")
+    def api_ticket_comments(issue_key: str):
+        client = holder.get()
+        raw = client.get_comments(issue_key)
+        comments = []
+        for c in raw:
+            author = c.get("author") or {}
+            comments.append({
+                "id": c.get("id"),
+                "author": author.get("displayName") or author.get("emailAddress") or "Unknown",
+                "avatar": (author.get("avatarUrls") or {}).get("24x24"),
+                "body": _adf_to_text(c.get("body") or {}).strip(),
+                "created": (c.get("created") or "")[:10],
+            })
+        return jsonify({"comments": comments})
+
+    @app.post("/api/ticket/<issue_key>/comment")
+    def api_ticket_add_comment(issue_key: str):
+        body = request.get_json(silent=True) or {}
+        text = (body.get("text") or "").strip()
+        if not text:
+            return jsonify({"error": "comment text is required"}), 400
+        client = holder.get()
+        client.add_comment(issue_key, text)
+        return jsonify({"ok": True})
+
     @app.get("/api/stale-children")
     def api_stale_children():
         view_name = request.args.get("view") or store.get_active()
@@ -353,6 +401,22 @@ def _short_json(d) -> str:
     import json as _json
     s = _json.dumps(d, default=str)
     return s if len(s) <= 80 else s[:77] + "…"
+
+
+def _adf_to_text(node) -> str:
+    """Recursively extract plain text from Atlassian Document Format."""
+    if not node or not isinstance(node, dict):
+        return ""
+    t = node.get("type", "")
+    if t == "text":
+        return node.get("text", "")
+    if t == "hardBreak":
+        return "\n"
+    parts = [_adf_to_text(c) for c in (node.get("content") or [])]
+    joined = "".join(parts)
+    if t in ("paragraph", "heading", "listItem", "blockquote", "codeBlock"):
+        return joined + "\n"
+    return joined
 
 
 DASHBOARD_HTML = r"""<!doctype html>
@@ -1448,6 +1512,113 @@ DASHBOARD_HTML = r"""<!doctype html>
   .panel-btn.danger { color: #cf222e; border-color: rgba(207,34,46,0.25); }
   .panel-btn.danger:hover { background: rgba(207,34,46,0.06); }
 
+  /* ─── DETAIL PANEL ───────────────────────────── */
+  .detail-panel { width: 520px; z-index: 51; }
+
+  .detail-header { flex-direction: column; align-items: flex-start; gap: 6px; }
+  .detail-header-top {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+  }
+  .detail-key {
+    font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 600;
+    background: var(--bg-subtle); border: 1px solid var(--border);
+    border-radius: var(--r-sm); padding: 3px 8px;
+    color: var(--accent); letter-spacing: 0.03em; flex-shrink: 0;
+  }
+  .detail-jira-link {
+    font-size: 11px; color: var(--muted); text-decoration: none;
+    margin-left: auto; padding: 3px 8px;
+    border: 1px solid var(--border); border-radius: var(--r-sm);
+    transition: all var(--t); white-space: nowrap;
+  }
+  .detail-jira-link:hover { color: var(--accent); border-color: var(--accent); }
+  .detail-summary {
+    padding: 0 18px 14px;
+    font-family: 'Syne', sans-serif; font-weight: 700; font-size: 15px;
+    line-height: 1.4; color: var(--text);
+    border-bottom: 1px solid var(--border);
+  }
+  .detail-fields {
+    display: grid; grid-template-columns: 1fr 1fr;
+    gap: 16px; padding: 16px 0;
+  }
+  .detail-field { display: flex; flex-direction: column; gap: 4px; }
+  .detail-field-label {
+    font-size: 9.5px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.07em; color: var(--muted);
+  }
+  .detail-field-value { font-size: 13px; color: var(--text); line-height: 1.4; }
+  .detail-section-title {
+    font-size: 9.5px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.07em; color: var(--muted);
+    padding: 14px 0 8px; border-top: 1px solid var(--border-subtle); margin-top: 2px;
+  }
+  .detail-child-row {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 8px 0; border-bottom: 1px solid var(--border-subtle); font-size: 12px;
+  }
+  .detail-child-row:last-child { border-bottom: none; }
+  .detail-child-key {
+    font-family: 'DM Mono', monospace; font-size: 10.5px;
+    color: var(--accent); flex-shrink: 0; min-width: 86px;
+    text-decoration: none;
+  }
+  .detail-child-key:hover { text-decoration: underline; }
+  .detail-child-meta { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+  .detail-child-summary { color: var(--text); line-height: 1.3; }
+  .detail-loading { color: var(--muted); font-size: 12px; padding: 16px 0; text-align: center; }
+  .detail-empty { color: var(--muted); font-size: 12px; padding: 10px 0; }
+
+  /* ─── COMMENTS ──────────────────────────────── */
+  .detail-comment {
+    display: flex; gap: 10px;
+    padding: 10px 0; border-bottom: 1px solid var(--border-subtle);
+  }
+  .detail-comment:last-child { border-bottom: none; }
+  .detail-comment-avatar {
+    width: 24px; height: 24px; border-radius: 50%;
+    flex-shrink: 0; background: var(--bg-subtle); object-fit: cover;
+  }
+  .detail-comment-avatar-placeholder {
+    width: 24px; height: 24px; border-radius: 50%;
+    flex-shrink: 0; background: var(--bg-hover);
+    border: 1px solid var(--border);
+  }
+  .detail-comment-body { flex: 1; min-width: 0; }
+  .detail-comment-meta { display: flex; align-items: baseline; gap: 6px; margin-bottom: 4px; }
+  .detail-comment-author { font-size: 11px; font-weight: 600; color: var(--text); }
+  .detail-comment-date { font-size: 10px; color: var(--muted); }
+  .detail-comment-text {
+    font-size: 12px; color: var(--text-secondary);
+    line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+  }
+  .detail-compose { margin-top: 14px; }
+  .detail-compose-input {
+    width: 100%; box-sizing: border-box;
+    padding: 8px 10px;
+    border: 1px solid var(--border); border-radius: var(--r-sm);
+    font: inherit; font-size: 12px;
+    background: var(--bg-input); color: var(--text);
+    resize: vertical; min-height: 66px;
+    transition: border-color var(--t);
+  }
+  .detail-compose-input:focus { outline: none; border-color: var(--accent); }
+  .detail-compose-input::placeholder { color: var(--muted); }
+  .detail-compose-footer { display: flex; justify-content: flex-end; margin-top: 6px; }
+  .detail-compose-submit {
+    font: inherit; font-size: 12px; font-weight: 500;
+    padding: 6px 16px;
+    background: var(--accent); color: #fff;
+    border: none; border-radius: var(--r-sm);
+    cursor: pointer; transition: opacity var(--t);
+  }
+  .detail-compose-submit:hover { opacity: 0.85; }
+  .detail-compose-submit:disabled { opacity: 0.45; cursor: default; }
+
+  tr[data-key] { cursor: pointer; }
+  tr.detail-active td { box-shadow: inset 2px 0 0 var(--accent); background: var(--sb-item-active); }
+  tr.detail-active:hover td { background: var(--sb-item-active); }
+
   .field-picker {
     border: 1px solid var(--border); border-radius: var(--r-sm);
     max-height: 200px; overflow-y: auto;
@@ -1646,6 +1817,22 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div class="selected-cols" id="selected-cols"></div>
     </div>
 
+  </div>
+</aside>
+
+<!-- ═══════════════════ DETAIL PANEL ════════════════════════════ -->
+<aside class="panel detail-panel" id="detail-panel">
+  <div class="panel-header detail-header">
+    <div class="detail-header-top">
+      <span class="detail-key" id="dp-key"></span>
+      <span id="dp-status"></span>
+      <a class="detail-jira-link" id="dp-jira-link" href="#" target="_blank" rel="noopener noreferrer">Open in Jira ↗</a>
+      <button class="panel-close" id="btn-close-detail">✕</button>
+    </div>
+  </div>
+  <div class="detail-summary" id="dp-summary"></div>
+  <div class="panel-body" id="detail-body">
+    <div id="detail-comments"></div>
   </div>
 </aside>
 
@@ -2062,6 +2249,7 @@ async function loadTickets() {
     STATE.jiraBase = data.jira_base_url;
     CHILD_CACHE.clear();
     EXPANDED.clear();
+    DETAIL_CACHE.clear();
     alertBarDismissed = false;
     renderKpis();
     renderCharts();
@@ -2138,6 +2326,188 @@ function scheduleRefresh() {
 
 const CHILD_CACHE = new Map();
 const EXPANDED = new Set();
+const DETAIL_CACHE = new Map();
+let DETAIL_OPEN_KEY = null;
+
+function openDetailPanel(key) {
+  DETAIL_OPEN_KEY = key;
+  // Update row highlights
+  document.querySelectorAll("tr.detail-active").forEach(r => r.classList.remove("detail-active"));
+  const activeRow = document.querySelector(`tr[data-key="${CSS.escape(key)}"]`);
+  if (activeRow) activeRow.classList.add("detail-active");
+
+  // Populate header immediately
+  $("#dp-key").textContent = key;
+  $("#dp-status").innerHTML = "";
+  $("#dp-jira-link").href = STATE.jiraBase ? `${STATE.jiraBase}/browse/${encodeURIComponent(key)}` : "#";
+  $("#dp-summary").textContent = "";
+  $("#detail-body").innerHTML = `<div class="detail-loading">Loading…</div><div id="detail-comments"></div>`;
+
+  $("#detail-panel").classList.add("open");
+  $("#panel-overlay").classList.add("open");
+
+  const detailPromise = DETAIL_CACHE.has(key)
+    ? Promise.resolve(DETAIL_CACHE.get(key))
+    : fetch(`/api/ticket/${encodeURIComponent(key)}`).then(r => r.json()).then(d => { DETAIL_CACHE.set(key, d); return d; });
+
+  const childrenPromise = CHILD_CACHE.has(key)
+    ? Promise.resolve(CHILD_CACHE.get(key))
+    : fetch(`/api/children/${encodeURIComponent(key)}?columns=${encodeURIComponent(STATE.columns.join(","))}`).then(r => r.json()).then(d => {
+        const tickets = d.tickets || [];
+        CHILD_CACHE.set(key, tickets);
+        return tickets;
+      });
+
+  Promise.all([detailPromise, childrenPromise])
+    .then(([ticket, children]) => {
+      if (DETAIL_OPEN_KEY !== key) return;
+      renderDetailBody(ticket, children);
+      loadComments(key);
+    })
+    .catch(() => {
+      if (DETAIL_OPEN_KEY !== key) return;
+      $("#detail-body").innerHTML = `<div class="detail-empty">Failed to load ticket details.</div><div id="detail-comments"></div>`;
+      loadComments(key);
+    });
+}
+
+function closeDetailPanel() {
+  DETAIL_OPEN_KEY = null;
+  document.querySelectorAll("tr.detail-active").forEach(r => r.classList.remove("detail-active"));
+  $("#detail-panel").classList.remove("open");
+  // Only remove overlay if drawer is also closed
+  if (!$("#drawer").classList.contains("open")) {
+    $("#panel-overlay").classList.remove("open");
+  }
+}
+
+function renderDetailBody(ticket, children) {
+  // Header
+  $("#dp-summary").textContent = ticket.summary || "";
+  const status = ticket.values?.status;
+  $("#dp-status").innerHTML = status && status.type === "status"
+    ? `<span class="badge cat-${fmt(status.category || "undefined")}">${fmt(status.display)}</span>`
+    : "";
+  const base = ticket.jira_base_url || STATE.jiraBase;
+  $("#dp-jira-link").href = base ? `${base}/browse/${encodeURIComponent(ticket.key)}` : "#";
+
+  // Field grid — skip summary and status (already in header)
+  const skipFields = new Set(["summary", "status"]);
+  const fieldEntries = Object.entries(ticket.values || {}).filter(([k, v]) => !skipFields.has(k) && v?.type !== "empty");
+
+  let html = "";
+  if (fieldEntries.length) {
+    html += `<div class="detail-fields">`;
+    for (const [fieldId, v] of fieldEntries) {
+      const label = columnLabel(fieldId);
+      html += `<div class="detail-field">
+        <div class="detail-field-label">${fmt(label)}</div>
+        <div class="detail-field-value">${renderValue(v)}</div>
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // Children section
+  html += `<div class="detail-section-title">Children (${children.length})</div>`;
+  if (!children.length) {
+    html += `<div class="detail-empty">No child items.</div>`;
+  } else {
+    for (const c of children) {
+      const cStatus = c.values?.status;
+      const statusHtml = cStatus && cStatus.type === "status"
+        ? `<span class="badge cat-${fmt(cStatus.category || "undefined")}">${fmt(cStatus.display)}</span>`
+        : "";
+      const childUrl = base ? `${base}/browse/${encodeURIComponent(c.key)}` : "#";
+      const staleHtml = c.is_stale ? `<span class="stale-badge">Stale</span>` : "";
+      html += `<div class="detail-child-row">
+        <a class="detail-child-key" href="${fmt(childUrl)}" target="_blank" rel="noopener">${fmt(c.key)}</a>
+        <div class="detail-child-meta">
+          <span class="detail-child-summary">${fmt(c.summary || "")}</span>
+          <span>${statusHtml}${staleHtml}</span>
+        </div>
+      </div>`;
+    }
+  }
+
+  // Leave #detail-comments in place for loadComments to populate
+  html += `<div id="detail-comments"></div>`;
+  $("#detail-body").innerHTML = html;
+}
+
+function loadComments(key) {
+  const el = document.getElementById("detail-comments");
+  if (!el) return;
+  el.innerHTML = `<div class="detail-section-title">Comments</div><div class="detail-loading">Loading comments…</div>`;
+  fetch(`/api/ticket/${encodeURIComponent(key)}/comments`)
+    .then(r => r.json())
+    .then(data => {
+      if (DETAIL_OPEN_KEY !== key) return;
+      renderComments(key, data.comments || []);
+    })
+    .catch(() => {
+      if (DETAIL_OPEN_KEY !== key) return;
+      const el2 = document.getElementById("detail-comments");
+      if (el2) el2.innerHTML = `<div class="detail-section-title">Comments</div><div class="detail-empty">Could not load comments.</div>`;
+    });
+}
+
+function renderComments(key, comments) {
+  const el = document.getElementById("detail-comments");
+  if (!el) return;
+  let html = `<div class="detail-section-title">Comments (${comments.length})</div>`;
+  if (comments.length) {
+    for (const c of comments) {
+      const avatarHtml = c.avatar
+        ? `<img class="detail-comment-avatar" src="${fmt(c.avatar)}" alt="">`
+        : `<div class="detail-comment-avatar-placeholder"></div>`;
+      html += `<div class="detail-comment">
+        ${avatarHtml}
+        <div class="detail-comment-body">
+          <div class="detail-comment-meta">
+            <span class="detail-comment-author">${fmt(c.author)}</span>
+            <span class="detail-comment-date">${fmt(c.created)}</span>
+          </div>
+          <div class="detail-comment-text">${fmt(c.body)}</div>
+        </div>
+      </div>`;
+    }
+  } else {
+    html += `<div class="detail-empty">No comments yet.</div>`;
+  }
+  html += `<div class="detail-compose">
+    <textarea class="detail-compose-input" id="comment-input-${fmt(key)}" placeholder="Add a comment…" rows="3"></textarea>
+    <div class="detail-compose-footer">
+      <button class="detail-compose-submit" id="comment-submit-${fmt(key)}">Add comment</button>
+    </div>
+  </div>`;
+  el.innerHTML = html;
+
+  const input = document.getElementById(`comment-input-${key}`);
+  const btn = document.getElementById(`comment-submit-${key}`);
+  if (btn && input) {
+    btn.addEventListener("click", () => submitComment(key, input, btn));
+    input.addEventListener("keydown", e => {
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submitComment(key, input, btn);
+    });
+  }
+}
+
+async function submitComment(key, input, btn) {
+  const text = input.value.trim();
+  if (!text) return;
+  btn.disabled = true;
+  btn.textContent = "Posting…";
+  try {
+    await api(`/api/ticket/${encodeURIComponent(key)}/comment`, {body: {text}});
+    input.value = "";
+    loadComments(key);
+  } catch (e) {
+    toast(e.message || "Failed to post comment", true);
+    btn.disabled = false;
+    btn.textContent = "Add comment";
+  }
+}
 
 function renderTable() {
   const head = $("#head-row");
@@ -2171,7 +2541,12 @@ function renderTable() {
     const tr = document.createElement("tr");
     tr.dataset.key = t.key;
     if (t.is_stale) tr.classList.add("stale");
+    if (t.key === DETAIL_OPEN_KEY) tr.classList.add("detail-active");
     tr.innerHTML = STATE.columns.map(c => `<td>${renderCell(t, c, !!t.has_children)}</td>`).join("");
+    tr.addEventListener("click", e => {
+      if (e.target.closest(".expand-btn") || e.target.closest("a")) return;
+      openDetailPanel(t.key);
+    });
     tbody.appendChild(tr);
 
     if (EXPANDED.has(t.key)) {
@@ -2233,8 +2608,15 @@ function insertChildRows(tbody, key, columns, tickets, afterRow) {
     const tr = document.createElement("tr");
     tr.className = "child-row";
     if (t.is_stale) tr.classList.add("stale");
+    if (t.key === DETAIL_OPEN_KEY) tr.classList.add("detail-active");
+    tr.dataset.key = t.key;
     tr.dataset.parent = key;
+    tr.style.cursor = "pointer";
     tr.innerHTML = columns.map(c => `<td>${renderCell(t, c, false)}</td>`).join("");
+    tr.addEventListener("click", e => {
+      if (e.target.closest("a")) return;
+      openDetailPanel(t.key);
+    });
     frag.appendChild(tr);
   }
   const ref = afterRow ? afterRow.nextSibling : null;
@@ -2368,7 +2750,10 @@ async function refreshJiraStatus() {
 }
 
 function openDrawer()  { $("#drawer").classList.add("open"); $("#panel-overlay").classList.add("open"); }
-function closeDrawer() { $("#drawer").classList.remove("open"); $("#panel-overlay").classList.remove("open"); }
+function closeDrawer() {
+  $("#drawer").classList.remove("open");
+  if (!DETAIL_OPEN_KEY) $("#panel-overlay").classList.remove("open");
+}
 
 // Sidebar collapse toggle
 let sidebarCollapsed = false;
@@ -2416,7 +2801,9 @@ function cycleTheme() {
 
 $("#btn-settings").addEventListener("click", openDrawer);
 $("#btn-close-drawer").addEventListener("click", closeDrawer);
-$("#panel-overlay").addEventListener("click", closeDrawer);
+$("#btn-close-detail").addEventListener("click", closeDetailPanel);
+$("#panel-overlay").addEventListener("click", () => { closeDrawer(); closeDetailPanel(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") { closeDrawer(); closeDetailPanel(); } });
 $("#btn-load").addEventListener("click", loadTickets);
 $("#btn-refresh").addEventListener("click", loadTickets);
 $("#query").addEventListener("keydown", e => { if (e.key === "Enter") loadTickets(); });
