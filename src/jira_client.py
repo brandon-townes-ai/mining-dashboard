@@ -95,6 +95,46 @@ class JiraClient:
         data = self._get(f"issue/{issue_key}/comment", maxResults=max_results, orderBy="-created")
         return data.get("comments", [])
 
+    def get_transitions(self, issue_key: str) -> list[dict]:
+        data = self._get(f"issue/{issue_key}/transitions")
+        return data.get("transitions", [])
+
+    def do_transition(self, issue_key: str, transition_id: str) -> None:
+        self._post(f"issue/{issue_key}/transitions", {"transition": {"id": transition_id}})
+
+    def _put(self, path: str, payload: dict) -> dict:
+        url = self._url(path)
+        self._log(f"PUT {url}")
+        resp = self._session.put(url, json=payload)
+        if resp.status_code == 400:
+            raise ValueError(f"Jira rejected request: {resp.text[:300]}")
+        if resp.status_code == 401:
+            raise JiraConfigError("Jira auth failed (401) — check email and API token.")
+        if resp.status_code == 403:
+            raise JiraConfigError("Jira permission denied (403).")
+        if resp.status_code == 404:
+            raise ValueError(f"Not found: {path}")
+        resp.raise_for_status()
+        return resp.json() if resp.content else {}
+
+    def list_priorities(self) -> list[dict]:
+        """Return all priorities available in this Jira instance."""
+        return self._get("priority")  # type: ignore[return-value]
+
+    def update_priority(self, issue_key: str, priority_name: str) -> None:
+        """Set the priority field on an issue by priority name."""
+        self._put(f"issue/{issue_key}", {"fields": {"priority": {"name": priority_name}}})
+
+    def get_assignable_users(self, project_key: str, query: str = "", max_results: int = 100) -> list[dict]:
+        params: dict = {"project": project_key, "maxResults": max_results}
+        if query:
+            params["query"] = query
+        return self._get("user/assignable/search", **params)  # type: ignore[return-value]
+
+    def update_assignee(self, issue_key: str, account_id: str | None) -> None:
+        value = {"accountId": account_id} if account_id else None
+        self._put(f"issue/{issue_key}", {"fields": {"assignee": value}})
+
     def add_comment(self, issue_key: str, text: str) -> dict:
         adf = {
             "version": 1, "type": "doc",

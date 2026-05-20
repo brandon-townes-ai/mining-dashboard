@@ -177,6 +177,68 @@ def create_app(store: ConfigStore) -> Flask:
         client.add_comment(issue_key, text)
         return jsonify({"ok": True})
 
+    @app.get("/api/ticket/<issue_key>/transitions")
+    def api_ticket_transitions(issue_key: str):
+        client = holder.get()
+        raw = client.get_transitions(issue_key)
+        transitions = []
+        for t in raw:
+            to = t.get("to") or {}
+            transitions.append({
+                "id": t.get("id"),
+                "name": t.get("name") or "",
+                "to_name": to.get("name") or "",
+                "to_category": (to.get("statusCategory") or {}).get("key") or "undefined",
+            })
+        return jsonify({"transitions": transitions})
+
+    @app.post("/api/ticket/<issue_key>/transition")
+    def api_ticket_do_transition(issue_key: str):
+        body = request.get_json(silent=True) or {}
+        transition_id = (body.get("transition_id") or "").strip()
+        if not transition_id:
+            return jsonify({"error": "transition_id is required"}), 400
+        client = holder.get()
+        client.do_transition(issue_key, transition_id)
+        return jsonify({"ok": True})
+
+    @app.get("/api/jira/priorities")
+    def api_jira_priorities():
+        raw = holder.get().list_priorities()
+        priorities = [{"id": p.get("id"), "name": p.get("name"), "icon": p.get("iconUrl")}
+                      for p in (raw if isinstance(raw, list) else [])]
+        return jsonify({"priorities": priorities})
+
+    @app.post("/api/ticket/<issue_key>/priority")
+    def api_ticket_set_priority(issue_key: str):
+        body = request.get_json(silent=True) or {}
+        priority_name = (body.get("priority_name") or "").strip()
+        if not priority_name:
+            return jsonify({"error": "priority_name is required"}), 400
+        client = holder.get()
+        client.update_priority(issue_key, priority_name)
+        return jsonify({"ok": True})
+
+    @app.get("/api/ticket/<issue_key>/assignees")
+    def api_ticket_assignees(issue_key: str):
+        project_key = issue_key.rsplit("-", 1)[0]
+        query = (request.args.get("q") or "").strip()
+        raw = holder.get().get_assignable_users(project_key, query=query)
+        users = [
+            {"accountId": u.get("accountId"), "name": u.get("displayName") or u.get("emailAddress") or "",
+             "avatar": (u.get("avatarUrls") or {}).get("24x24")}
+            for u in (raw if isinstance(raw, list) else [])
+            if u.get("accountId")
+        ]
+        return jsonify({"users": users})
+
+    @app.post("/api/ticket/<issue_key>/assignee")
+    def api_ticket_set_assignee(issue_key: str):
+        body = request.get_json(silent=True) or {}
+        account_id = (body.get("account_id") or "").strip() or None
+        holder.get().update_assignee(issue_key, account_id)
+        return jsonify({"ok": True})
+
     @app.get("/api/stale-children")
     def api_stale_children():
         view_name = request.args.get("view") or store.get_active()
@@ -356,7 +418,8 @@ def _render_field(field_id: str, raw, base_url: str):
         if "displayName" in raw or "emailAddress" in raw or "accountId" in raw:
             name = raw.get("displayName") or raw.get("emailAddress") or ""
             return {"type": "user", "display": name, "sort": name,
-                    "avatar": (raw.get("avatarUrls") or {}).get("24x24")}
+                    "avatar": (raw.get("avatarUrls") or {}).get("24x24"),
+                    "accountId": raw.get("accountId") or ""}
         if "name" in raw and "iconUrl" in raw and "id" in raw:
             return {"type": "option", "display": raw.get("name") or "", "sort": raw.get("name") or "",
                     "icon": raw.get("iconUrl")}
@@ -1514,10 +1577,20 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   /* ─── DETAIL PANEL ───────────────────────────── */
   .detail-panel { width: 520px; z-index: 51; }
+  .detail-panel .panel-header { padding: 0; }
 
-  .detail-header { flex-direction: column; align-items: flex-start; gap: 6px; }
+  .detail-header { flex-direction: column; align-items: stretch; gap: 0; padding: 12px 16px 16px; }
   .detail-header-top {
-    display: flex; align-items: center; gap: 8px; width: 100%;
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: 10px;
+  }
+  .detail-header-controls {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+    justify-content: center;
+  }
+  .ctrl-sep {
+    width: 1px; height: 16px; background: var(--border);
+    flex-shrink: 0; border-radius: 1px; opacity: 0.7;
   }
   .detail-key {
     font-family: 'DM Mono', monospace; font-size: 11px; font-weight: 600;
@@ -1529,14 +1602,13 @@ DASHBOARD_HTML = r"""<!doctype html>
     font-size: 11px; color: var(--muted); text-decoration: none;
     margin-left: auto; padding: 3px 8px;
     border: 1px solid var(--border); border-radius: var(--r-sm);
-    transition: all var(--t); white-space: nowrap;
+    transition: all var(--t); white-space: nowrap; flex-shrink: 0;
   }
   .detail-jira-link:hover { color: var(--accent); border-color: var(--accent); }
   .detail-summary {
-    padding: 0 18px 14px;
+    padding: 8px 0 12px;
     font-family: 'Syne', sans-serif; font-weight: 700; font-size: 15px;
     line-height: 1.4; color: var(--text);
-    border-bottom: 1px solid var(--border);
   }
   .detail-fields {
     display: grid; grid-template-columns: 1fr 1fr;
@@ -1614,6 +1686,180 @@ DASHBOARD_HTML = r"""<!doctype html>
   }
   .detail-compose-submit:hover { opacity: 0.85; }
   .detail-compose-submit:disabled { opacity: 0.45; cursor: default; }
+
+  /* ─── STATUS TRANSITIONS ─────────────────────── */
+  .detail-status-wrap { position: relative; display: inline-block; }
+  .status-btn {
+    background: none; border: 1px solid var(--border); border-radius: var(--r-sm);
+    cursor: pointer; padding: 5px 10px;
+    display: inline-flex; align-items: center; gap: 5px; font: inherit;
+    font-size: 12px; transition: border-color var(--t);
+  }
+  .status-btn:hover { border-color: var(--muted); }
+  .status-btn.open { border-color: var(--accent); }
+  .status-btn-chevron {
+    font-size: 8px; color: var(--muted);
+    transition: transform var(--t); line-height: 1;
+  }
+  .status-btn.open .status-btn-chevron { transform: rotate(180deg); }
+  .priority-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .priority-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    padding: 5px 10px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    color: var(--text-secondary);
+    transition: border-color var(--t), color var(--t);
+  }
+  .priority-btn:hover { border-color: var(--muted); color: var(--text); }
+  .priority-btn.open { border-color: var(--accent); color: var(--accent); }
+  .priority-btn-icon { width: 14px; height: 14px; flex-shrink: 0; }
+  .priority-btn-chevron { font-size: 8px; opacity: 0.6; }
+
+  .priority-menu {
+    display: none;
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: 200;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    box-shadow: var(--shadow-md);
+    min-width: 140px;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .priority-menu.open { display: flex; }
+
+  .priority-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text);
+    transition: background var(--t);
+  }
+  .priority-item:hover { background: var(--bg-hover); }
+  .priority-item.current { font-weight: 600; color: var(--accent); }
+  .priority-item-icon { width: 14px; height: 14px; flex-shrink: 0; }
+
+  .assignee-wrap {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+  }
+  .assignee-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    padding: 5px 10px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    color: var(--text-secondary);
+    transition: border-color var(--t), color var(--t);
+    max-width: 180px;
+  }
+  .assignee-btn:hover { border-color: var(--muted); color: var(--text); }
+  .assignee-btn.open { border-color: var(--accent); color: var(--accent); }
+  .assignee-btn-avatar {
+    width: 16px; height: 16px; border-radius: 50%; flex-shrink: 0;
+  }
+  .assignee-btn-name {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .assignee-btn-chevron { font-size: 8px; opacity: 0.6; flex-shrink: 0; }
+
+  .assignee-menu {
+    display: none;
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: 200;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--r);
+    box-shadow: var(--shadow-md);
+    min-width: 200px;
+    max-height: 280px;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .assignee-menu.open { display: flex; }
+  .assignee-search-wrap {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .assignee-search {
+    width: 100%;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+    font-size: 12px;
+    outline: none;
+    box-sizing: border-box;
+  }
+  .assignee-search:focus { border-color: var(--accent); }
+  .assignee-search::placeholder { color: var(--muted); }
+  .assignee-list {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+  .assignee-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 12px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text);
+    transition: background var(--t);
+  }
+  .assignee-item:hover { background: var(--bg-hover); }
+  .assignee-item.current { font-weight: 600; color: var(--accent); }
+  .assignee-item-avatar { width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0; }
+  .assignee-item-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .transitions-menu {
+    position: absolute; top: calc(100% + 6px); left: 0;
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--r); box-shadow: var(--shadow-md);
+    z-index: 200; min-width: 270px;
+    display: none; flex-direction: column; overflow: hidden;
+  }
+  .transitions-menu.open { display: flex; }
+  .transition-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 14px; cursor: pointer;
+    font-size: 13px; color: var(--text);
+    transition: background var(--t);
+  }
+  .transition-item:hover { background: var(--bg-hover); }
+  .transition-item-name { flex: 1; }
+  .transition-arrow { color: var(--muted); font-size: 10px; flex-shrink: 0; }
 
   tr[data-key] { cursor: pointer; }
   tr.detail-active td { box-shadow: inset 2px 0 0 var(--accent); background: var(--sb-item-active); }
@@ -1825,12 +2071,27 @@ DASHBOARD_HTML = r"""<!doctype html>
   <div class="panel-header detail-header">
     <div class="detail-header-top">
       <span class="detail-key" id="dp-key"></span>
-      <span id="dp-status"></span>
       <a class="detail-jira-link" id="dp-jira-link" href="#" target="_blank" rel="noopener noreferrer">Open in Jira ↗</a>
       <button class="panel-close" id="btn-close-detail">✕</button>
     </div>
+    <div class="detail-summary" id="dp-summary"></div>
+    <div class="detail-header-controls">
+      <div class="detail-status-wrap">
+        <span id="dp-status"></span>
+        <div class="transitions-menu" id="transitions-menu"></div>
+      </div>
+      <span class="ctrl-sep"></span>
+      <div class="priority-wrap" id="priority-wrap">
+        <button class="priority-btn" id="priority-btn" title="Change priority" style="display:none"></button>
+        <div class="priority-menu" id="priority-menu"></div>
+      </div>
+      <span class="ctrl-sep"></span>
+      <div class="assignee-wrap" id="assignee-wrap">
+        <button class="assignee-btn" id="assignee-btn" title="Change assignee" style="display:none"></button>
+        <div class="assignee-menu" id="assignee-menu"></div>
+      </div>
+    </div>
   </div>
-  <div class="detail-summary" id="dp-summary"></div>
   <div class="panel-body" id="detail-body">
     <div id="detail-comments"></div>
   </div>
@@ -2250,6 +2511,7 @@ async function loadTickets() {
     CHILD_CACHE.clear();
     EXPANDED.clear();
     DETAIL_CACHE.clear();
+    TRANSITIONS_CACHE.clear();
     alertBarDismissed = false;
     renderKpis();
     renderCharts();
@@ -2327,6 +2589,7 @@ function scheduleRefresh() {
 const CHILD_CACHE = new Map();
 const EXPANDED = new Set();
 const DETAIL_CACHE = new Map();
+const TRANSITIONS_CACHE = new Map();
 let DETAIL_OPEN_KEY = null;
 
 function openDetailPanel(key) {
@@ -2338,7 +2601,14 @@ function openDetailPanel(key) {
 
   // Populate header immediately
   $("#dp-key").textContent = key;
-  $("#dp-status").innerHTML = "";
+  const dpStatus = $("#dp-status");
+  if (dpStatus) dpStatus.innerHTML = "";
+  closePriorityMenu();
+  closeAssigneeMenu();
+  const dpPriorityBtn = document.getElementById("priority-btn");
+  if (dpPriorityBtn) dpPriorityBtn.style.display = "none";
+  const dpAssigneeBtn = document.getElementById("assignee-btn");
+  if (dpAssigneeBtn) dpAssigneeBtn.style.display = "none";
   $("#dp-jira-link").href = STATE.jiraBase ? `${STATE.jiraBase}/browse/${encodeURIComponent(key)}` : "#";
   $("#dp-summary").textContent = "";
   $("#detail-body").innerHTML = `<div class="detail-loading">Loading…</div><div id="detail-comments"></div>`;
@@ -2374,6 +2644,9 @@ function openDetailPanel(key) {
 function closeDetailPanel() {
   DETAIL_OPEN_KEY = null;
   document.querySelectorAll("tr.detail-active").forEach(r => r.classList.remove("detail-active"));
+  closeTransitionsMenu();
+  closePriorityMenu();
+  closeAssigneeMenu();
   $("#detail-panel").classList.remove("open");
   // Only remove overlay if drawer is also closed
   if (!$("#drawer").classList.contains("open")) {
@@ -2381,18 +2654,387 @@ function closeDetailPanel() {
   }
 }
 
+function renderStatusBtn(key, status) {
+  const el = $("#dp-status");
+  if (!el) return;
+  if (!status || status.type !== "status") { el.innerHTML = ""; return; }
+  const badgeHtml = `<span class="badge cat-${fmt(status.category || "undefined")}">${fmt(status.display)}</span>`;
+  el.innerHTML = `<button class="status-btn" id="status-transition-btn" title="Change status">
+    ${badgeHtml}<span class="status-btn-chevron">▼</span>
+  </button>`;
+  document.getElementById("status-transition-btn")
+    .addEventListener("click", e => { e.stopPropagation(); toggleTransitionsMenu(key); });
+}
+
+function closeTransitionsMenu() {
+  const menu = $("#transitions-menu");
+  const btn = document.getElementById("status-transition-btn");
+  if (menu) menu.classList.remove("open");
+  if (btn) btn.classList.remove("open");
+}
+
+function toggleTransitionsMenu(key) {
+  const menu = $("#transitions-menu");
+  const btn = document.getElementById("status-transition-btn");
+  if (!menu) return;
+  if (menu.classList.contains("open")) { closeTransitionsMenu(); return; }
+
+  menu.innerHTML = `<div class="transition-item" style="color:var(--muted);cursor:default">Loading…</div>`;
+  menu.classList.add("open");
+  if (btn) btn.classList.add("open");
+
+  const load = TRANSITIONS_CACHE.has(key)
+    ? Promise.resolve(TRANSITIONS_CACHE.get(key))
+    : fetch(`/api/ticket/${encodeURIComponent(key)}/transitions`).then(r => r.json()).then(d => {
+        TRANSITIONS_CACHE.set(key, d.transitions || []);
+        return d.transitions || [];
+      });
+
+  load.then(transitions => {
+    if (!menu.classList.contains("open")) return;
+    if (!transitions.length) {
+      menu.innerHTML = `<div class="transition-item" style="color:var(--muted);cursor:default">No transitions available</div>`;
+      return;
+    }
+    menu.innerHTML = transitions.map(t =>
+      `<div class="transition-item" data-id="${fmt(t.id)}" data-name="${fmt(t.to_name)}" data-cat="${fmt(t.to_category)}">
+        <span class="transition-item-name">${fmt(t.name)}</span>
+        <span class="transition-arrow">→</span>
+        <span class="badge cat-${fmt(t.to_category || "undefined")}">${fmt(t.to_name)}</span>
+      </div>`
+    ).join("");
+    menu.querySelectorAll(".transition-item").forEach(item => {
+      item.addEventListener("click", () => {
+        doTransition(key, item.dataset.id, item.dataset.name, item.dataset.cat);
+      });
+    });
+  }).catch(() => {
+    if (menu.classList.contains("open"))
+      menu.innerHTML = `<div class="transition-item" style="color:var(--muted);cursor:default">Failed to load</div>`;
+  });
+
+  setTimeout(() => {
+    document.addEventListener("click", function handler(e) {
+      if (!e.target.closest(".detail-status-wrap")) {
+        closeTransitionsMenu();
+        document.removeEventListener("click", handler);
+      }
+    });
+  }, 0);
+}
+
+async function doTransition(key, transitionId, toName, toCategory) {
+  closeTransitionsMenu();
+  const el = $("#dp-status");
+  const prev = el ? el.innerHTML : "";
+  if (el) el.innerHTML = `<span class="badge cat-${fmt(toCategory || "undefined")}" style="opacity:0.5">${fmt(toName)}</span>`;
+  try {
+    await api(`/api/ticket/${encodeURIComponent(key)}/transition`, {body: {transition_id: transitionId}});
+    // Update header badge fully
+    if (el) el.innerHTML = `<button class="status-btn" id="status-transition-btn" title="Change status">
+      <span class="badge cat-${fmt(toCategory || "undefined")}">${fmt(toName)}</span>
+      <span class="status-btn-chevron">▼</span>
+    </button>`;
+    document.getElementById("status-transition-btn")
+      ?.addEventListener("click", e => { e.stopPropagation(); toggleTransitionsMenu(key); });
+    // Invalidate caches so re-open fetches fresh data
+    DETAIL_CACHE.delete(key);
+    TRANSITIONS_CACHE.delete(key);
+    // Update table row status cell
+    updateTableRowStatus(key, toName, toCategory);
+    toast(`Status → ${toName}`);
+  } catch (e) {
+    if (el) el.innerHTML = prev;
+    toast(e.message || "Transition failed", true);
+  }
+}
+
+function updateTableRowStatus(key, toName, toCategory) {
+  const statusColIdx = STATE.columns.indexOf("status");
+  if (statusColIdx < 0) return;
+  const row = document.querySelector(`tr[data-key="${CSS.escape(key)}"]`);
+  if (!row) return;
+  const td = row.querySelectorAll("td")[statusColIdx];
+  if (td) td.innerHTML = `<span class="badge cat-${fmt(toCategory || "undefined")}">${fmt(toName)}</span>`;
+}
+
+// ─── PRIORITY DROPDOWN ───────────────────────────────────────────────
+const PRIORITIES_CACHE = { list: null };
+
+function renderPriorityBtn(key, priorityValue) {
+  const btn = document.getElementById("priority-btn");
+  const menu = document.getElementById("priority-menu");
+  if (!btn || !menu) return;
+
+  const isEmpty = !priorityValue || priorityValue.type === "empty";
+  const name = isEmpty ? "No priority" : (priorityValue.display || "");
+  const icon = isEmpty ? "" : (priorityValue.icon || "");
+  const iconHtml = icon ? `<img class="priority-btn-icon" src="${fmt(icon)}" alt="">` : "";
+  btn.innerHTML = `${iconHtml}<span style="${isEmpty ? "color:var(--muted)" : ""}">${fmt(name)}</span><span class="priority-btn-chevron">▼</span>`;
+  btn.style.display = "";
+  btn.onclick = e => { e.stopPropagation(); togglePriorityMenu(key, name); };
+}
+
+function closePriorityMenu() {
+  const menu = document.getElementById("priority-menu");
+  const btn = document.getElementById("priority-btn");
+  if (menu) menu.classList.remove("open");
+  if (btn) btn.classList.remove("open");
+}
+
+function togglePriorityMenu(key, currentName) {
+  const menu = document.getElementById("priority-menu");
+  const btn = document.getElementById("priority-btn");
+  if (!menu) return;
+  if (menu.classList.contains("open")) { closePriorityMenu(); return; }
+
+  menu.innerHTML = `<div class="priority-item" style="color:var(--muted);cursor:default">Loading…</div>`;
+  menu.classList.add("open");
+  if (btn) btn.classList.add("open");
+
+  const load = PRIORITIES_CACHE.list
+    ? Promise.resolve(PRIORITIES_CACHE.list)
+    : fetch("/api/jira/priorities").then(r => r.json()).then(data => {
+        PRIORITIES_CACHE.list = data.priorities || [];
+        return PRIORITIES_CACHE.list;
+      });
+
+  load.then(priorities => {
+    if (!menu.classList.contains("open")) return;
+    if (!priorities.length) {
+      menu.innerHTML = `<div class="priority-item" style="color:var(--muted);cursor:default">No priorities found</div>`;
+      return;
+    }
+    menu.innerHTML = priorities.map(p => {
+      const isCurrent = p.name === currentName;
+      const iconHtml = p.icon
+        ? `<img class="priority-item-icon" src="${fmt(p.icon)}" alt="">`
+        : "";
+      return `<div class="priority-item${isCurrent ? " current" : ""}" data-name="${fmt(p.name)}" data-icon="${fmt(p.icon || "")}">
+        ${iconHtml}<span>${fmt(p.name)}</span>
+      </div>`;
+    }).join("");
+    menu.querySelectorAll(".priority-item[data-name]").forEach(item => {
+      item.addEventListener("click", () => {
+        doPriorityChange(key, item.dataset.name, item.dataset.icon);
+      });
+    });
+  }).catch(() => {
+    if (menu.classList.contains("open"))
+      menu.innerHTML = `<div class="priority-item" style="color:var(--muted);cursor:default">Failed to load</div>`;
+  });
+
+  setTimeout(() => {
+    document.addEventListener("click", function handler(e) {
+      if (!e.target.closest("#priority-wrap")) {
+        closePriorityMenu();
+        document.removeEventListener("click", handler);
+      }
+    });
+  }, 0);
+}
+
+async function doPriorityChange(key, newName, newIcon) {
+  closePriorityMenu();
+  const btn = document.getElementById("priority-btn");
+  const prevHtml = btn ? btn.innerHTML : "";
+  if (btn) {
+    const iconHtml = newIcon ? `<img class="priority-btn-icon" src="${fmt(newIcon)}" alt="">` : "";
+    btn.innerHTML = `${iconHtml}<span style="opacity:0.5">${fmt(newName)}</span><span class="priority-btn-chevron">▼</span>`;
+  }
+  try {
+    await api(`/api/ticket/${encodeURIComponent(key)}/priority`, {body: {priority_name: newName}});
+    // Refresh btn with new value
+    if (btn) {
+      const iconHtml = newIcon ? `<img class="priority-btn-icon" src="${fmt(newIcon)}" alt="">` : "";
+      btn.innerHTML = `${iconHtml}<span>${fmt(newName)}</span><span class="priority-btn-chevron">▼</span>`;
+      btn.onclick = e => { e.stopPropagation(); togglePriorityMenu(key, newName); };
+    }
+    // Invalidate detail cache so re-open fetches fresh data
+    DETAIL_CACHE.delete(key);
+    // Update priority cell in the main table row if the column is visible
+    updateTableRowPriority(key, newName, newIcon);
+    toast(`Priority → ${newName}`);
+  } catch (e) {
+    if (btn) btn.innerHTML = prevHtml;
+    toast(e.message || "Priority update failed", true);
+  }
+}
+
+function updateTableRowPriority(key, newName, newIcon) {
+  const priorityColIdx = STATE.columns.indexOf("priority");
+  if (priorityColIdx < 0) return;
+  const row = document.querySelector(`tr[data-key="${CSS.escape(key)}"]`);
+  if (!row) return;
+  const td = row.querySelectorAll("td")[priorityColIdx];
+  if (!td) return;
+  const iconHtml = newIcon ? `<img style="width:14px;height:14px;vertical-align:middle;margin-right:4px" src="${fmt(newIcon)}" alt="">` : "";
+  td.innerHTML = `${iconHtml}${fmt(newName)}`;
+}
+
+// --- Assignee ---
+const ASSIGNEE_CACHE = new Map(); // key → [{accountId, name, avatar}]
+
+function renderAssigneeBtn(key, assigneeValue) {
+  const btn = document.getElementById("assignee-btn");
+  if (!btn) return;
+  const isEmpty = !assigneeValue || assigneeValue.type === "empty";
+  const name = isEmpty ? "Unassigned" : (assigneeValue.display || "Unassigned");
+  const avatar = isEmpty ? "" : (assigneeValue.avatar || "");
+  const accountId = isEmpty ? "" : (assigneeValue.accountId || "");
+  const avatarHtml = avatar ? `<img class="assignee-btn-avatar" src="${fmt(avatar)}" alt="">` : "";
+  btn.innerHTML = `${avatarHtml}<span class="assignee-btn-name" style="${isEmpty ? "color:var(--muted)" : ""}">${fmt(name)}</span><span class="assignee-btn-chevron">▼</span>`;
+  btn.dataset.accountId = accountId;
+  btn.style.display = "";
+  btn.onclick = e => { e.stopPropagation(); toggleAssigneeMenu(key, accountId); };
+}
+
+function closeAssigneeMenu() {
+  const menu = document.getElementById("assignee-menu");
+  const btn = document.getElementById("assignee-btn");
+  if (menu) menu.classList.remove("open");
+  if (btn) btn.classList.remove("open");
+}
+
+function toggleAssigneeMenu(key, currentAccountId) {
+  const menu = document.getElementById("assignee-menu");
+  const btn = document.getElementById("assignee-btn");
+  if (!menu || !btn) return;
+  if (menu.classList.contains("open")) { closeAssigneeMenu(); return; }
+  menu.innerHTML = `<div class="assignee-item" style="color:var(--muted);cursor:default">Loading…</div>`;
+  menu.classList.add("open");
+  btn.classList.add("open");
+  // Build the shell immediately so the search input is visible right away
+  menu.innerHTML = `
+    <div class="assignee-search-wrap">
+      <input class="assignee-search" id="assignee-search-input" type="text" placeholder="Search by name…" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="assignee-list" id="assignee-list"></div>`;
+  const list = menu.querySelector("#assignee-list");
+  const searchInput = menu.querySelector("#assignee-search-input");
+
+  function renderUserList(users) {
+    if (!users.length) {
+      list.innerHTML = `<div class="assignee-item" style="color:var(--muted);cursor:default">No matches</div>`;
+      return;
+    }
+    list.innerHTML = users.map(u => {
+      const isCurrent = u.accountId === currentAccountId;
+      const avatarHtml = u.avatar
+        ? `<img class="assignee-item-avatar" src="${fmt(u.avatar)}" alt="">`
+        : `<span style="width:20px;height:20px;border-radius:50%;background:var(--border);display:inline-block;flex-shrink:0"></span>`;
+      return `<div class="assignee-item${isCurrent ? " current" : ""}" data-account-id="${fmt(u.accountId)}" data-name="${fmt(u.name)}" data-avatar="${fmt(u.avatar || "")}">
+        ${avatarHtml}<span class="assignee-item-name">${fmt(u.name)}</span>
+      </div>`;
+    }).join("");
+    list.querySelectorAll(".assignee-item[data-account-id]").forEach(item => {
+      item.addEventListener("click", () => {
+        doAssigneeChange(key, item.dataset.accountId, item.dataset.name, item.dataset.avatar);
+      });
+    });
+  }
+
+  // Initial load from cache or server (unfiltered)
+  list.innerHTML = `<div class="assignee-item" style="color:var(--muted);cursor:default">Loading…</div>`;
+  const initialLoad = ASSIGNEE_CACHE.has(key)
+    ? Promise.resolve(ASSIGNEE_CACHE.get(key))
+    : fetch(`/api/ticket/${encodeURIComponent(key)}/assignees`).then(r => r.json()).then(data => {
+        ASSIGNEE_CACHE.set(key, data.users || []);
+        return data.users || [];
+      });
+  initialLoad.then(users => {
+    if (!menu.classList.contains("open")) return;
+    renderUserList(users);
+  }).catch(() => {
+    list.innerHTML = `<div class="assignee-item" style="color:var(--muted);cursor:default">Failed to load</div>`;
+  });
+
+  // Debounced server-side search — Jira's ?query= param searches across all project members,
+  // not just the first 100 returned by the unfiltered call
+  let searchTimer = null;
+  searchInput.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    const q = searchInput.value.trim();
+    if (!q) {
+      // Restore unfiltered cached list
+      const cached = ASSIGNEE_CACHE.get(key) || [];
+      renderUserList(cached);
+      return;
+    }
+    list.innerHTML = `<div class="assignee-item" style="color:var(--muted);cursor:default">Searching…</div>`;
+    searchTimer = setTimeout(() => {
+      fetch(`/api/ticket/${encodeURIComponent(key)}/assignees?q=${encodeURIComponent(q)}`)
+        .then(r => r.json())
+        .then(data => {
+          if (!menu.classList.contains("open")) return;
+          if (searchInput.value.trim() !== q) return; // stale response
+          renderUserList(data.users || []);
+        })
+        .catch(() => {
+          list.innerHTML = `<div class="assignee-item" style="color:var(--muted);cursor:default">Search failed</div>`;
+        });
+    }, 300);
+  });
+
+  searchInput.addEventListener("keydown", e => { if (e.key === "Escape") { closeAssigneeMenu(); } });
+  setTimeout(() => { if (menu.classList.contains("open")) searchInput.focus(); }, 0);
+
+  const onOutside = e => {
+    if (!e.target.closest("#assignee-wrap")) { closeAssigneeMenu(); document.removeEventListener("click", onOutside, true); }
+  };
+  document.addEventListener("click", onOutside, true);
+}
+
+async function doAssigneeChange(key, accountId, newName, newAvatar) {
+  closeAssigneeMenu();
+  const btn = document.getElementById("assignee-btn");
+  const prevHtml = btn ? btn.innerHTML : "";
+  if (btn) {
+    const avatarHtml = newAvatar ? `<img class="assignee-btn-avatar" src="${fmt(newAvatar)}" alt="">` : "";
+    btn.innerHTML = `${avatarHtml}<span class="assignee-btn-name" style="opacity:0.5">${fmt(newName || "Unassigned")}</span><span class="assignee-btn-chevron">▼</span>`;
+    btn.dataset.accountId = accountId;
+  }
+  try {
+    await api(`/api/ticket/${encodeURIComponent(key)}/assignee`, {body: {account_id: accountId || null}});
+    if (btn) {
+      const avatarHtml = newAvatar ? `<img class="assignee-btn-avatar" src="${fmt(newAvatar)}" alt="">` : "";
+      btn.innerHTML = `${avatarHtml}<span class="assignee-btn-name">${fmt(newName || "Unassigned")}</span><span class="assignee-btn-chevron">▼</span>`;
+      btn.onclick = e => { e.stopPropagation(); toggleAssigneeMenu(key, accountId); };
+    }
+    DETAIL_CACHE.delete(key);
+    updateTableRowAssignee(key, newName, newAvatar);
+    toast(`Assignee → ${newName || "Unassigned"}`);
+  } catch (e) {
+    if (btn) btn.innerHTML = prevHtml;
+    toast(e.message || "Assignee update failed", true);
+  }
+}
+
+function updateTableRowAssignee(key, newName, newAvatar) {
+  const assigneeColIdx = STATE.columns.indexOf("assignee");
+  if (assigneeColIdx < 0) return;
+  const row = document.querySelector(`tr[data-key="${CSS.escape(key)}"]`);
+  if (!row) return;
+  const td = row.querySelectorAll("td")[assigneeColIdx];
+  if (!td) return;
+  const avatarHtml = newAvatar ? `<img style="width:16px;height:16px;border-radius:50%;vertical-align:middle;margin-right:4px" src="${fmt(newAvatar)}" alt="">` : "";
+  td.innerHTML = `${avatarHtml}${fmt(newName || "Unassigned")}`;
+}
+
 function renderDetailBody(ticket, children) {
   // Header
   $("#dp-summary").textContent = ticket.summary || "";
   const status = ticket.values?.status;
-  $("#dp-status").innerHTML = status && status.type === "status"
-    ? `<span class="badge cat-${fmt(status.category || "undefined")}">${fmt(status.display)}</span>`
-    : "";
+  renderStatusBtn(ticket.key, status);
+  const priority = ticket.values?.priority;
+  renderPriorityBtn(ticket.key, priority);
+  const assignee = ticket.values?.assignee;
+  renderAssigneeBtn(ticket.key, assignee);
   const base = ticket.jira_base_url || STATE.jiraBase;
   $("#dp-jira-link").href = base ? `${base}/browse/${encodeURIComponent(ticket.key)}` : "#";
 
-  // Field grid — skip summary and status (already in header)
-  const skipFields = new Set(["summary", "status"]);
+  // Field grid — skip summary, status, priority, and assignee (shown in header)
+  const skipFields = new Set(["summary", "status", "priority", "assignee"]);
   const fieldEntries = Object.entries(ticket.values || {}).filter(([k, v]) => !skipFields.has(k) && v?.type !== "empty");
 
   let html = "";
@@ -2803,7 +3445,13 @@ $("#btn-settings").addEventListener("click", openDrawer);
 $("#btn-close-drawer").addEventListener("click", closeDrawer);
 $("#btn-close-detail").addEventListener("click", closeDetailPanel);
 $("#panel-overlay").addEventListener("click", () => { closeDrawer(); closeDetailPanel(); });
-document.addEventListener("keydown", e => { if (e.key === "Escape") { closeDrawer(); closeDetailPanel(); } });
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") {
+    const menu = $("#transitions-menu");
+    if (menu && menu.classList.contains("open")) { closeTransitionsMenu(); return; }
+    closeDrawer(); closeDetailPanel();
+  }
+});
 $("#btn-load").addEventListener("click", loadTickets);
 $("#btn-refresh").addEventListener("click", loadTickets);
 $("#query").addEventListener("keydown", e => { if (e.key === "Enter") loadTickets(); });
