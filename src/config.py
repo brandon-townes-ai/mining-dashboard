@@ -6,7 +6,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Any
 
-APP_VERSION = "1.0.7"
+APP_VERSION = "1.0.8"
 
 CONFIG_FILENAME = "mining_dashboard.config.json"
 
@@ -37,7 +37,7 @@ _OFFROAD_JQL = (
 )
 
 SEED_VIEWS: dict[str, dict] = {
-    "VSTAB Off Road epics": dict(DEFAULT_VIEW),
+    "VSTAB Off Road Epics": dict(DEFAULT_VIEW),
     "Offroad Stack Issues": {
         **DEFAULT_VIEW,
         "jql": _OFFROAD_JQL,
@@ -47,6 +47,7 @@ SEED_VIEWS: dict[str, dict] = {
 
 VIEW_RENAMES: dict[str, str] = {
     "EC-11955 children": "Offroad Stack Issues",
+    "VSTAB Off Road epics": "VSTAB Off Road Epics",
 }
 
 JQL_MIGRATIONS: dict[str, str] = {
@@ -57,7 +58,7 @@ JQL_MIGRATIONS: dict[str, str] = {
 }
 
 DEFAULT_CONFIG = {
-    "active_view": "VSTAB Off Road epics",
+    "active_view": "VSTAB Off Road Epics",
     "views": {k: dict(v) for k, v in SEED_VIEWS.items()},
 }
 
