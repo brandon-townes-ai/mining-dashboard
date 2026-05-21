@@ -4,6 +4,7 @@ import os
 import pathlib
 import re
 from datetime import datetime, timezone, timedelta
+from html import escape as _he
 from threading import RLock
 
 from flask import Flask, jsonify, render_template_string, request
@@ -133,7 +134,7 @@ def create_app(store: ConfigStore) -> Flask:
     def api_ticket_detail(issue_key: str):
         client = holder.get()
         detail_fields = [
-            "summary", "status", "assignee", "priority", "labels",
+            "summary", "description", "status", "assignee", "priority", "labels",
             "components", "parent", "created", "updated",
             "customfield_14138", "customfield_10212",
             "customfield_10210", "customfield_13420",
@@ -141,15 +142,30 @@ def create_app(store: ConfigStore) -> Flask:
         fields = client.get_issue_fields(issue_key, detail_fields)
         values = {}
         for fid in detail_fields:
-            if fid == "summary":
+            if fid in ("summary", "description"):
                 continue
             values[fid] = _render_field(fid, fields.get(fid), client.base_url)
         return jsonify({
             "key": issue_key,
             "summary": fields.get("summary") or "",
+            "description_html": _adf_to_html(fields.get("description") or {}),
             "jira_base_url": client.base_url,
             "values": values,
         })
+
+    _me_cache: dict = {}
+
+    @app.get("/api/me")
+    def api_me():
+        if not _me_cache:
+            client = holder.get()
+            me = client.verify_auth()
+            _me_cache.update({
+                "accountId": me.get("accountId", ""),
+                "name": me.get("displayName", ""),
+                "avatar": (me.get("avatarUrls") or {}).get("24x24", ""),
+            })
+        return jsonify(dict(_me_cache))
 
     @app.get("/api/ticket/<issue_key>/comments")
     def api_ticket_comments(issue_key: str):
@@ -158,23 +174,47 @@ def create_app(store: ConfigStore) -> Flask:
         comments = []
         for c in raw:
             author = c.get("author") or {}
+            adf = c.get("body") or {}
+            created = (c.get("created") or "")[:10]
+            updated = (c.get("updated") or "")[:10]
             comments.append({
                 "id": c.get("id"),
                 "author": author.get("displayName") or author.get("emailAddress") or "Unknown",
+                "author_id": author.get("accountId", ""),
                 "avatar": (author.get("avatarUrls") or {}).get("24x24"),
-                "body": _adf_to_text(c.get("body") or {}).strip(),
-                "created": (c.get("created") or "")[:10],
+                "body_html": _adf_to_html(adf),
+                "body_text": _adf_to_text(adf).strip(),
+                "created": created,
+                "edited": created != updated,
             })
         return jsonify({"comments": comments})
 
     @app.post("/api/ticket/<issue_key>/comment")
     def api_ticket_add_comment(issue_key: str):
         body = request.get_json(silent=True) or {}
+        segments = body.get("segments")
         text = (body.get("text") or "").strip()
-        if not text:
+        if not segments and not text:
             return jsonify({"error": "comment text is required"}), 400
         client = holder.get()
-        client.add_comment(issue_key, text)
+        client.add_comment(issue_key, text=text, segments=segments or None)
+        return jsonify({"ok": True})
+
+    @app.put("/api/ticket/<issue_key>/comment/<comment_id>")
+    def api_ticket_update_comment(issue_key: str, comment_id: str):
+        body = request.get_json(silent=True) or {}
+        segments = body.get("segments")
+        text = (body.get("text") or "").strip()
+        if not segments and not text:
+            return jsonify({"error": "comment text is required"}), 400
+        client = holder.get()
+        client.update_comment(issue_key, comment_id, text=text, segments=segments or None)
+        return jsonify({"ok": True})
+
+    @app.delete("/api/ticket/<issue_key>/comment/<comment_id>")
+    def api_ticket_delete_comment(issue_key: str, comment_id: str):
+        client = holder.get()
+        client.delete_comment(issue_key, comment_id)
         return jsonify({"ok": True})
 
     @app.get("/api/ticket/<issue_key>/transitions")
@@ -480,6 +520,70 @@ def _adf_to_text(node) -> str:
     if t in ("paragraph", "heading", "listItem", "blockquote", "codeBlock"):
         return joined + "\n"
     return joined
+
+
+_ISSUE_KEY_RE = re.compile(r"/browse/([A-Z]+-\d+)")
+
+
+def _adf_to_html(node) -> str:
+    """Render Atlassian Document Format node to safe HTML."""
+    if not node or not isinstance(node, dict):
+        return ""
+    t = node.get("type", "")
+    children = "".join(_adf_to_html(c) for c in (node.get("content") or []))
+
+    if t == "doc":
+        return children
+    if t == "paragraph":
+        inner = children.strip()
+        return f"<p>{inner}</p>" if inner else "<p></p>"
+    if t == "hardBreak":
+        return "<br>"
+    if t == "text":
+        txt = _he(node.get("text", ""))
+        for mark in reversed(node.get("marks") or []):
+            mt = mark.get("type", "")
+            if mt == "strong":
+                txt = f"<strong>{txt}</strong>"
+            elif mt == "em":
+                txt = f"<em>{txt}</em>"
+            elif mt == "code":
+                txt = f"<code>{txt}</code>"
+            elif mt == "strike":
+                txt = f"<s>{txt}</s>"
+            elif mt == "underline":
+                txt = f"<u>{txt}</u>"
+            elif mt == "link":
+                href = mark.get("attrs", {}).get("href", "")
+                if href.startswith(("http://", "https://")):
+                    txt = f'<a href="{_he(href)}" target="_blank" rel="noopener">{txt}</a>'
+        return txt
+    if t == "mention":
+        name = _he((node.get("attrs") or {}).get("text", "@unknown"))
+        return f'<span class="comment-mention">{name}</span>'
+    if t == "inlineCard":
+        url = (node.get("attrs") or {}).get("url", "")
+        if url.startswith(("http://", "https://")):
+            m = _ISSUE_KEY_RE.search(url)
+            label = _he(m.group(1)) if m else _he(url)
+            return f'<a class="jira-issue-link" href="{_he(url)}" target="_blank" rel="noopener">{label}</a>'
+        return ""
+    if t == "blockquote":
+        return f"<blockquote>{children}</blockquote>"
+    if t == "bulletList":
+        return f"<ul>{children}</ul>"
+    if t == "orderedList":
+        return f"<ol>{children}</ol>"
+    if t == "listItem":
+        return f"<li>{children}</li>"
+    if t == "heading":
+        lvl = min(max(int((node.get("attrs") or {}).get("level", 3)), 1), 6)
+        return f"<h{lvl}>{children}</h{lvl}>"
+    if t == "codeBlock":
+        return f"<pre><code>{children}</code></pre>"
+    if t == "rule":
+        return "<hr>"
+    return children
 
 
 DASHBOARD_HTML = r"""<!doctype html>
@@ -1610,6 +1714,34 @@ DASHBOARD_HTML = r"""<!doctype html>
     font-family: 'Syne', sans-serif; font-weight: 700; font-size: 15px;
     line-height: 1.4; color: var(--text);
   }
+  .detail-description {
+    font-size: 12px; color: var(--text-secondary);
+    line-height: 1.6; word-break: break-word;
+    padding: 12px 0 4px;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .detail-description p { margin: 0 0 6px; }
+  .detail-description p:last-child { margin-bottom: 0; }
+  .detail-description a { color: var(--accent); text-decoration: none; }
+  .detail-description a:hover { text-decoration: underline; }
+  .detail-description code { font-family: 'DM Mono', monospace; font-size: 10.5px; background: var(--bg-hover); padding: 1px 4px; border-radius: 3px; }
+  .detail-description pre { background: var(--bg-hover); padding: 8px 10px; border-radius: var(--r-sm); overflow-x: auto; margin: 4px 0; }
+  .detail-description pre code { background: none; padding: 0; }
+  .detail-description blockquote { border-left: 3px solid var(--border); margin: 4px 0; padding-left: 8px; color: var(--muted); }
+  .detail-description ul, .detail-description ol { margin: 4px 0; padding-left: 18px; }
+  .detail-description h1, .detail-description h2, .detail-description h3,
+  .detail-description h4, .detail-description h5, .detail-description h6 {
+    font-size: 12px; font-weight: 700; margin: 8px 0 4px; color: var(--text);
+  }
+  .detail-description .comment-mention { color: var(--accent); font-weight: 500; }
+  .detail-description .jira-issue-link {
+    font-family: 'DM Mono', monospace; font-size: 10.5px;
+    color: var(--accent); background: var(--bg-subtle);
+    border: 1px solid var(--border); border-radius: 3px;
+    padding: 1px 5px; text-decoration: none; white-space: nowrap;
+  }
+  .detail-description .jira-issue-link:hover { border-color: var(--accent); }
+  .detail-description-empty { color: var(--muted); font-size: 12px; font-style: italic; padding: 10px 0 4px; border-top: 1px solid var(--border-subtle); }
   .detail-fields {
     display: grid; grid-template-columns: 1fr 1fr;
     gap: 16px; padding: 16px 0;
@@ -1662,8 +1794,57 @@ DASHBOARD_HTML = r"""<!doctype html>
   .detail-comment-date { font-size: 10px; color: var(--muted); }
   .detail-comment-text {
     font-size: 12px; color: var(--text-secondary);
-    line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+    line-height: 1.55; word-break: break-word;
   }
+  .detail-comment-text p { margin: 0 0 4px; }
+  .detail-comment-text p:last-child { margin-bottom: 0; }
+  .detail-comment-text a { color: var(--accent); text-decoration: none; }
+  .detail-comment-text a:hover { text-decoration: underline; }
+  .detail-comment-text code { font-family: 'DM Mono', monospace; font-size: 10.5px; background: var(--bg-hover); padding: 1px 4px; border-radius: 3px; }
+  .detail-comment-text pre { background: var(--bg-hover); padding: 8px 10px; border-radius: var(--r-sm); overflow-x: auto; margin: 4px 0; }
+  .detail-comment-text pre code { background: none; padding: 0; }
+  .detail-comment-text blockquote { border-left: 3px solid var(--border); margin: 4px 0; padding-left: 8px; color: var(--muted); }
+  .detail-comment-text ul, .detail-comment-text ol { margin: 4px 0; padding-left: 18px; }
+  .comment-mention { color: var(--accent); font-weight: 500; }
+  .jira-issue-link {
+    font-family: 'DM Mono', monospace; font-size: 10.5px;
+    color: var(--accent); background: var(--bg-subtle);
+    border: 1px solid var(--border); border-radius: 3px;
+    padding: 1px 5px; text-decoration: none; white-space: nowrap;
+  }
+  .jira-issue-link:hover { border-color: var(--accent); }
+  .comment-edited { font-size: 10px; color: var(--muted); font-style: italic; }
+  .detail-comment-actions { display: flex; gap: 10px; margin-top: 5px; }
+  .comment-action-btn {
+    font: inherit; font-size: 11px; color: var(--muted);
+    background: none; border: none; cursor: pointer; padding: 0;
+    transition: color var(--t);
+  }
+  .comment-action-btn:hover { color: var(--text); }
+  .comment-action-btn.danger:hover { color: #e05; }
+  .comment-edit-wrap { margin-top: 4px; }
+  .comment-edit-input {
+    width: 100%; box-sizing: border-box; padding: 6px 8px;
+    border: 1px solid var(--accent); border-radius: var(--r-sm);
+    font: inherit; font-size: 12px; background: var(--bg-input); color: var(--text);
+    resize: vertical; min-height: 54px;
+  }
+  .comment-edit-input:focus { outline: none; }
+  .comment-edit-footer { display: flex; gap: 6px; justify-content: flex-end; margin-top: 4px; }
+  .comment-edit-save {
+    font: inherit; font-size: 11px; font-weight: 500; padding: 4px 12px;
+    background: var(--accent); color: #fff; border: none; border-radius: var(--r-sm);
+    cursor: pointer; transition: opacity var(--t);
+  }
+  .comment-edit-save:hover { opacity: 0.85; }
+  .comment-edit-save:disabled { opacity: 0.45; cursor: default; }
+  .comment-edit-cancel {
+    font: inherit; font-size: 11px; padding: 4px 10px;
+    background: none; color: var(--muted);
+    border: 1px solid var(--border); border-radius: var(--r-sm);
+    cursor: pointer; transition: color var(--t);
+  }
+  .comment-edit-cancel:hover { color: var(--text); }
   .detail-compose { margin-top: 14px; }
   .detail-compose-input {
     width: 100%; box-sizing: border-box;
@@ -1686,6 +1867,24 @@ DASHBOARD_HTML = r"""<!doctype html>
   }
   .detail-compose-submit:hover { opacity: 0.85; }
   .detail-compose-submit:disabled { opacity: 0.45; cursor: default; }
+  .detail-compose { position: relative; }
+  .mention-dropdown {
+    position: absolute; left: 0; right: 0;
+    bottom: calc(100% + 4px);
+    z-index: 300;
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--r); box-shadow: var(--shadow-md);
+    max-height: 200px; overflow-y: auto;
+    display: none; flex-direction: column;
+  }
+  .mention-dropdown.open { display: flex; }
+  .mention-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 12px; cursor: pointer; font-size: 13px;
+    transition: background var(--t);
+  }
+  .mention-item:hover, .mention-item.active { background: var(--bg-hover); }
+  .mention-item-avatar { width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0; }
 
   /* ─── STATUS TRANSITIONS ─────────────────────── */
   .detail-status-wrap { position: relative; display: inline-block; }
@@ -2101,6 +2300,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 const $ = sel => document.querySelector(sel);
 const fmt = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const PROFILE_URL = "{{ profile_url }}";
+
+let CURRENT_USER = null;
 
 const STATE = {
   config: null,
@@ -3033,11 +3234,19 @@ function renderDetailBody(ticket, children) {
   const base = ticket.jira_base_url || STATE.jiraBase;
   $("#dp-jira-link").href = base ? `${base}/browse/${encodeURIComponent(ticket.key)}` : "#";
 
-  // Field grid — skip summary, status, priority, and assignee (shown in header)
-  const skipFields = new Set(["summary", "status", "priority", "assignee"]);
+  // Description
+  const descHtml = ticket.description_html || "";
+  let html = "";
+  if (descHtml.trim()) {
+    html += `<div class="detail-description">${descHtml}</div>`;
+  } else {
+    html += `<div class="detail-description-empty">No description.</div>`;
+  }
+
+  // Field grid — skip summary, description, status, priority, and assignee (shown in header/description)
+  const skipFields = new Set(["summary", "description", "status", "priority", "assignee"]);
   const fieldEntries = Object.entries(ticket.values || {}).filter(([k, v]) => !skipFields.has(k) && v?.type !== "empty");
 
-  let html = "";
   if (fieldEntries.length) {
     html += `<div class="detail-fields">`;
     for (const [fieldId, v] of fieldEntries) {
@@ -3103,14 +3312,23 @@ function renderComments(key, comments) {
       const avatarHtml = c.avatar
         ? `<img class="detail-comment-avatar" src="${fmt(c.avatar)}" alt="">`
         : `<div class="detail-comment-avatar-placeholder"></div>`;
-      html += `<div class="detail-comment">
+      const isOwn = CURRENT_USER && c.author_id && c.author_id === CURRENT_USER.accountId;
+      const actionsHtml = isOwn
+        ? `<div class="detail-comment-actions">
+            <button class="comment-action-btn" data-action="edit" data-id="${fmt(c.id)}">Edit</button>
+            <button class="comment-action-btn danger" data-action="delete" data-id="${fmt(c.id)}">Delete</button>
+           </div>`
+        : "";
+      html += `<div class="detail-comment" data-comment-id="${fmt(c.id)}">
         ${avatarHtml}
         <div class="detail-comment-body">
           <div class="detail-comment-meta">
             <span class="detail-comment-author">${fmt(c.author)}</span>
             <span class="detail-comment-date">${fmt(c.created)}</span>
+            ${c.edited ? `<span class="comment-edited">(edited)</span>` : ""}
           </div>
-          <div class="detail-comment-text">${fmt(c.body)}</div>
+          <div class="detail-comment-text" data-body-text="${fmt(c.body_text)}">${c.body_html}</div>
+          ${actionsHtml}
         </div>
       </div>`;
     }
@@ -3118,31 +3336,180 @@ function renderComments(key, comments) {
     html += `<div class="detail-empty">No comments yet.</div>`;
   }
   html += `<div class="detail-compose">
-    <textarea class="detail-compose-input" id="comment-input-${fmt(key)}" placeholder="Add a comment…" rows="3"></textarea>
+    <div class="mention-dropdown" id="mention-dd-${fmt(key)}"></div>
+    <textarea class="detail-compose-input" id="comment-input-${fmt(key)}" placeholder="Add a comment… (type @ to mention)" rows="3"></textarea>
     <div class="detail-compose-footer">
       <button class="detail-compose-submit" id="comment-submit-${fmt(key)}">Add comment</button>
     </div>
   </div>`;
   el.innerHTML = html;
 
+  // Wire up Edit / Delete buttons
+  el.querySelectorAll(".comment-action-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.id;
+      if (btn.dataset.action === "delete") {
+        if (!confirm("Delete this comment?")) return;
+        btn.disabled = true;
+        api(`/api/ticket/${encodeURIComponent(key)}/comment/${encodeURIComponent(id)}`, {method: "DELETE"})
+          .then(() => { toast("Comment deleted"); loadComments(key); })
+          .catch(e => { toast(e.message || "Delete failed", true); btn.disabled = false; });
+      } else if (btn.dataset.action === "edit") {
+        const commentEl = el.querySelector(`.detail-comment[data-comment-id="${CSS.escape(id)}"]`);
+        if (!commentEl) return;
+        const textEl = commentEl.querySelector(".detail-comment-text");
+        const actionsEl = commentEl.querySelector(".detail-comment-actions");
+        const originalHtml = textEl.innerHTML;
+        const originalText = textEl.dataset.bodyText || "";
+        textEl.style.display = "none";
+        if (actionsEl) actionsEl.style.display = "none";
+        const wrap = document.createElement("div");
+        wrap.className = "comment-edit-wrap";
+        wrap.innerHTML = `<textarea class="comment-edit-input">${originalText.replace(/</g,"&lt;")}</textarea>
+          <div class="comment-edit-footer">
+            <button class="comment-edit-cancel">Cancel</button>
+            <button class="comment-edit-save">Save</button>
+          </div>`;
+        textEl.after(wrap);
+        const ta = wrap.querySelector("textarea");
+        const saveBtn = wrap.querySelector(".comment-edit-save");
+        const cancelBtn = wrap.querySelector(".comment-edit-cancel");
+        ta.focus();
+        cancelBtn.addEventListener("click", () => {
+          wrap.remove();
+          textEl.style.display = "";
+          if (actionsEl) actionsEl.style.display = "";
+        });
+        saveBtn.addEventListener("click", () => {
+          const newText = ta.value.trim();
+          if (!newText) return;
+          saveBtn.disabled = true; saveBtn.textContent = "Saving…";
+          api(`/api/ticket/${encodeURIComponent(key)}/comment/${encodeURIComponent(id)}`, {method: "PUT", body: {text: newText}})
+            .then(() => { toast("Comment updated"); loadComments(key); })
+            .catch(e => { toast(e.message || "Update failed", true); saveBtn.disabled = false; saveBtn.textContent = "Save"; });
+        });
+      }
+    });
+  });
+
   const input = document.getElementById(`comment-input-${key}`);
   const btn = document.getElementById(`comment-submit-${key}`);
-  if (btn && input) {
-    btn.addEventListener("click", () => submitComment(key, input, btn));
-    input.addEventListener("keydown", e => {
-      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) submitComment(key, input, btn);
-    });
+  const dropdown = document.getElementById(`mention-dd-${key}`);
+
+  if (!btn || !input || !dropdown) return;
+
+  const mentionMap = new Map();
+  let mentionStart = -1;
+  let mentionTimer = null;
+
+  function hideMentionDropdown() {
+    dropdown.classList.remove("open");
+    dropdown.innerHTML = "";
+    clearTimeout(mentionTimer);
   }
+
+  function selectMention(accountId, name) {
+    const val = input.value;
+    const insert = `@${name} `;
+    input.value = val.slice(0, mentionStart) + insert + val.slice(input.selectionStart);
+    input.selectionStart = input.selectionEnd = mentionStart + insert.length;
+    mentionMap.set(name, accountId);
+    hideMentionDropdown();
+    input.focus();
+  }
+
+  function showMentionDropdown(q) {
+    dropdown.classList.add("open");
+    dropdown.innerHTML = `<div class="mention-item" style="color:var(--muted);cursor:default;font-size:12px">Searching…</div>`;
+    clearTimeout(mentionTimer);
+    mentionTimer = setTimeout(() => {
+      fetch(`/api/ticket/${encodeURIComponent(key)}/assignees?q=${encodeURIComponent(q)}`)
+        .then(r => r.json()).then(data => {
+          const users = data.users || [];
+          if (!users.length) {
+            dropdown.innerHTML = `<div class="mention-item" style="color:var(--muted);cursor:default;font-size:12px">No matches</div>`;
+            return;
+          }
+          dropdown.innerHTML = users.slice(0, 8).map((u, i) => {
+            const av = u.avatar
+              ? `<img class="mention-item-avatar" src="${fmt(u.avatar)}" alt="">`
+              : `<span class="mention-item-avatar" style="background:var(--border)"></span>`;
+            return `<div class="mention-item${i===0?" active":""}" data-account-id="${fmt(u.accountId)}" data-name="${fmt(u.name)}">${av}${fmt(u.name)}</div>`;
+          }).join("");
+          dropdown.querySelectorAll(".mention-item[data-account-id]").forEach(item => {
+            item.addEventListener("mousedown", e => {
+              e.preventDefault();
+              selectMention(item.dataset.accountId, item.dataset.name);
+            });
+          });
+        }).catch(() => hideMentionDropdown());
+    }, 250);
+  }
+
+  input.addEventListener("input", () => {
+    const pos = input.selectionStart;
+    const before = input.value.slice(0, pos);
+    const atMatch = before.match(/@([\w][\w .]*)$|@$/);
+    if (atMatch) {
+      mentionStart = before.lastIndexOf("@");
+      const q = atMatch[1] || "";
+      showMentionDropdown(q);
+    } else {
+      hideMentionDropdown();
+    }
+  });
+
+  input.addEventListener("keydown", e => {
+    if (dropdown.classList.contains("open")) {
+      if (e.key === "Escape") { e.preventDefault(); hideMentionDropdown(); return; }
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const items = [...dropdown.querySelectorAll(".mention-item[data-account-id]")];
+        if (!items.length) return;
+        const cur = dropdown.querySelector(".mention-item.active");
+        const idx = items.indexOf(cur);
+        const next = e.key === "ArrowDown" ? items[(idx + 1) % items.length] : items[(idx - 1 + items.length) % items.length];
+        if (cur) cur.classList.remove("active");
+        next.classList.add("active");
+        return;
+      }
+      if (e.key === "Enter" && !e.metaKey && !e.ctrlKey) {
+        const active = dropdown.querySelector(".mention-item.active[data-account-id]");
+        if (active) { e.preventDefault(); selectMention(active.dataset.accountId, active.dataset.name); return; }
+      }
+    }
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { hideMentionDropdown(); submitComment(key, input, btn, mentionMap); }
+  });
+
+  btn.addEventListener("click", () => submitComment(key, input, btn, mentionMap));
 }
 
-async function submitComment(key, input, btn) {
+function buildCommentSegments(text, map) {
+  if (!map.size) return null;
+  const names = [...map.keys()].sort((a, b) => b.length - a.length);
+  const escaped = names.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const regex = new RegExp(`@(${escaped.join("|")})`, "g");
+  const segments = [];
+  let last = 0, m;
+  while ((m = regex.exec(text)) !== null) {
+    if (m.index > last) segments.push({type: "text", text: text.slice(last, m.index)});
+    segments.push({type: "mention", id: map.get(m[1]), text: `@${m[1]}`});
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) segments.push({type: "text", text: text.slice(last)});
+  return segments;
+}
+
+async function submitComment(key, input, btn, mentionMap) {
   const text = input.value.trim();
   if (!text) return;
   btn.disabled = true;
   btn.textContent = "Posting…";
+  const segments = mentionMap ? buildCommentSegments(text, mentionMap) : null;
   try {
-    await api(`/api/ticket/${encodeURIComponent(key)}/comment`, {body: {text}});
+    await api(`/api/ticket/${encodeURIComponent(key)}/comment`, {body: segments ? {segments} : {text}});
     input.value = "";
+    if (mentionMap) mentionMap.clear();
     loadComments(key);
   } catch (e) {
     toast(e.message || "Failed to post comment", true);
@@ -3484,6 +3851,7 @@ $("#btn-theme").addEventListener("click", cycleTheme);
 applyTheme(getTheme());
 
 (async function init() {
+  fetch("/api/me").then(r => r.json()).then(d => { CURRENT_USER = d; }).catch(() => {});
   await loadConfig();
   await refreshJiraStatus();
   await loadFields();

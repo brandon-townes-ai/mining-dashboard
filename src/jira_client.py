@@ -135,9 +135,47 @@ class JiraClient:
         value = {"accountId": account_id} if account_id else None
         self._put(f"issue/{issue_key}", {"fields": {"assignee": value}})
 
-    def add_comment(self, issue_key: str, text: str) -> dict:
-        adf = {
-            "version": 1, "type": "doc",
-            "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}],
-        }
+    def _delete(self, path: str) -> None:
+        url = self._url(path)
+        self._log(f"DELETE {url}")
+        resp = self._session.delete(url)
+        if resp.status_code == 401:
+            raise JiraConfigError("Jira auth failed (401).")
+        if resp.status_code == 403:
+            raise JiraConfigError("Jira permission denied (403).")
+        if resp.status_code == 404:
+            raise ValueError(f"Not found: {path}")
+        resp.raise_for_status()
+
+    def delete_comment(self, issue_key: str, comment_id: str) -> None:
+        self._delete(f"issue/{issue_key}/comment/{comment_id}")
+
+    def update_comment(self, issue_key: str, comment_id: str, text: str = "", segments: list[dict] | None = None) -> dict:
+        if segments:
+            content = []
+            for seg in segments:
+                if seg.get("type") == "mention":
+                    content.append({"type": "mention",
+                        "attrs": {"id": seg["id"], "text": seg["text"], "accessLevel": ""}})
+                elif seg.get("text"):
+                    content.append({"type": "text", "text": seg["text"]})
+        else:
+            content = [{"type": "text", "text": text}]
+        adf = {"version": 1, "type": "doc",
+               "content": [{"type": "paragraph", "content": content}]}
+        return self._put(f"issue/{issue_key}/comment/{comment_id}", {"body": adf})
+
+    def add_comment(self, issue_key: str, text: str = "", segments: list[dict] | None = None) -> dict:
+        if segments:
+            content = []
+            for seg in segments:
+                if seg.get("type") == "mention":
+                    content.append({"type": "mention",
+                        "attrs": {"id": seg["id"], "text": seg["text"], "accessLevel": ""}})
+                elif seg.get("text"):
+                    content.append({"type": "text", "text": seg["text"]})
+        else:
+            content = [{"type": "text", "text": text}]
+        adf = {"version": 1, "type": "doc",
+               "content": [{"type": "paragraph", "content": content}]}
         return self._post(f"issue/{issue_key}/comment", {"body": adf})
