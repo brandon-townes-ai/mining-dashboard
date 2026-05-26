@@ -135,6 +135,9 @@ class JiraClient:
         value = {"accountId": account_id} if account_id else None
         self._put(f"issue/{issue_key}", {"fields": {"assignee": value}})
 
+    def update_duedate(self, issue_key: str, date_str: str | None) -> None:
+        self._put(f"issue/{issue_key}", {"fields": {"duedate": date_str or None}})
+
     def _delete(self, path: str) -> None:
         url = self._url(path)
         self._log(f"DELETE {url}")

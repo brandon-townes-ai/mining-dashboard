@@ -134,7 +134,7 @@ def create_app(store: ConfigStore) -> Flask:
     def api_ticket_detail(issue_key: str):
         client = holder.get()
         detail_fields = [
-            "summary", "description", "status", "assignee", "priority", "labels",
+            "summary", "description", "duedate", "status", "assignee", "priority", "labels",
             "components", "parent", "created", "updated",
             "customfield_14138", "customfield_10212",
             "customfield_10210", "customfield_13420",
@@ -142,13 +142,14 @@ def create_app(store: ConfigStore) -> Flask:
         fields = client.get_issue_fields(issue_key, detail_fields)
         values = {}
         for fid in detail_fields:
-            if fid in ("summary", "description"):
+            if fid in ("summary", "description", "duedate"):
                 continue
             values[fid] = _render_field(fid, fields.get(fid), client.base_url)
         return jsonify({
             "key": issue_key,
             "summary": fields.get("summary") or "",
             "description_html": _adf_to_html(fields.get("description") or {}),
+            "duedate": fields.get("duedate") or "",
             "jira_base_url": client.base_url,
             "values": values,
         })
@@ -277,6 +278,13 @@ def create_app(store: ConfigStore) -> Flask:
         body = request.get_json(silent=True) or {}
         account_id = (body.get("account_id") or "").strip() or None
         holder.get().update_assignee(issue_key, account_id)
+        return jsonify({"ok": True})
+
+    @app.post("/api/ticket/<issue_key>/duedate")
+    def api_ticket_set_duedate(issue_key: str):
+        body = request.get_json(silent=True) or {}
+        date_str = (body.get("date") or "").strip() or None
+        holder.get().update_duedate(issue_key, date_str)
         return jsonify({"ok": True})
 
     @app.get("/api/stale-children")
@@ -1689,7 +1697,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     margin-bottom: 10px;
   }
   .detail-header-controls {
-    display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+    display: flex; align-items: center; flex-wrap: nowrap; gap: 8px;
     justify-content: center;
   }
   .ctrl-sep {
@@ -1712,7 +1720,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .detail-summary {
     padding: 8px 0 12px;
     font-family: 'Syne', sans-serif; font-weight: 700; font-size: 15px;
-    line-height: 1.4; color: var(--text);
+    line-height: 1.4; color: var(--text); text-align: center;
   }
   .detail-description {
     font-size: 12px; color: var(--text-secondary);
@@ -1889,13 +1897,13 @@ DASHBOARD_HTML = r"""<!doctype html>
   /* ─── STATUS TRANSITIONS ─────────────────────── */
   .detail-status-wrap { position: relative; display: inline-block; }
   .status-btn {
-    background: none; border: 1px solid var(--border); border-radius: var(--r-sm);
-    cursor: pointer; padding: 5px 10px;
+    background: none; border: none; border-radius: var(--r-sm);
+    cursor: pointer; padding: 3px 6px;
     display: inline-flex; align-items: center; gap: 5px; font: inherit;
-    font-size: 12px; transition: border-color var(--t);
+    font-size: 12px; transition: opacity var(--t);
   }
-  .status-btn:hover { border-color: var(--muted); }
-  .status-btn.open { border-color: var(--accent); }
+  .status-btn:hover { opacity: 0.8; }
+  .status-btn.open { opacity: 0.8; }
   .status-btn-chevron {
     font-size: 8px; color: var(--muted);
     transition: transform var(--t); line-height: 1;
@@ -1912,17 +1920,17 @@ DASHBOARD_HTML = r"""<!doctype html>
     align-items: center;
     gap: 4px;
     background: none;
-    border: 1px solid var(--border);
+    border: none;
     border-radius: var(--r-sm);
-    padding: 5px 10px;
+    padding: 3px 6px;
     cursor: pointer;
     font: inherit;
     font-size: 12px;
     color: var(--text-secondary);
-    transition: border-color var(--t), color var(--t);
+    transition: color var(--t);
   }
-  .priority-btn:hover { border-color: var(--muted); color: var(--text); }
-  .priority-btn.open { border-color: var(--accent); color: var(--accent); }
+  .priority-btn:hover { color: var(--text); }
+  .priority-btn.open { color: var(--accent); }
   .priority-btn-icon { width: 14px; height: 14px; flex-shrink: 0; }
   .priority-btn-chevron { font-size: 8px; opacity: 0.6; }
 
@@ -1966,18 +1974,18 @@ DASHBOARD_HTML = r"""<!doctype html>
     align-items: center;
     gap: 5px;
     background: none;
-    border: 1px solid var(--border);
+    border: none;
     border-radius: var(--r-sm);
-    padding: 5px 10px;
+    padding: 3px 6px;
     cursor: pointer;
     font: inherit;
     font-size: 12px;
     color: var(--text-secondary);
-    transition: border-color var(--t), color var(--t);
-    max-width: 180px;
+    transition: color var(--t);
+    max-width: 130px;
   }
-  .assignee-btn:hover { border-color: var(--muted); color: var(--text); }
-  .assignee-btn.open { border-color: var(--accent); color: var(--accent); }
+  .assignee-btn:hover { color: var(--text); }
+  .assignee-btn.open { color: var(--accent); }
   .assignee-btn-avatar {
     width: 16px; height: 16px; border-radius: 50%; flex-shrink: 0;
   }
@@ -2041,6 +2049,25 @@ DASHBOARD_HTML = r"""<!doctype html>
   .assignee-item.current { font-weight: 600; color: var(--accent); }
   .assignee-item-avatar { width: 20px; height: 20px; border-radius: 50%; flex-shrink: 0; }
   .assignee-item-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ─── DUE DATE ───────────────────────────────── */
+  .duedate-wrap { position: relative; display: inline-flex; align-items: center; }
+  .duedate-btn {
+    position: relative;
+    display: inline-flex; align-items: center; gap: 5px;
+    background: none; border: none; border-radius: var(--r-sm);
+    padding: 3px 6px; cursor: pointer; font: inherit; font-size: 12px;
+    color: var(--text-secondary); transition: color var(--t);
+    white-space: nowrap; overflow: hidden;
+  }
+  .duedate-btn:hover { color: var(--text); }
+  .duedate-btn.overdue { color: var(--blocked); }
+  .duedate-btn.overdue:hover { opacity: 0.85; }
+  .duedate-btn-chevron { font-size: 8px; opacity: 0.6; }
+  .duedate-input {
+    position: absolute; inset: 0; opacity: 0; cursor: pointer;
+    width: 100%; height: 100%; z-index: 1; border: none; background: none;
+  }
 
   .transitions-menu {
     position: absolute; top: calc(100% + 6px); left: 0;
@@ -2289,6 +2316,8 @@ DASHBOARD_HTML = r"""<!doctype html>
         <button class="assignee-btn" id="assignee-btn" title="Change assignee" style="display:none"></button>
         <div class="assignee-menu" id="assignee-menu"></div>
       </div>
+      <span class="ctrl-sep"></span>
+      <div class="duedate-wrap" id="duedate-wrap"></div>
     </div>
   </div>
   <div class="panel-body" id="detail-body">
@@ -3222,6 +3251,51 @@ function updateTableRowAssignee(key, newName, newAvatar) {
   td.innerHTML = `${avatarHtml}${fmt(newName || "Unassigned")}`;
 }
 
+// ─── DUE DATE ────────────────────────────────────────────────────────────────
+
+const _CAL_ICON = `<svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;opacity:0.75"><rect x="1" y="2.5" width="12" height="10.5" rx="1.5"/><line x1="1" y1="5.5" x2="13" y2="5.5"/><line x1="4.5" y1="1" x2="4.5" y2="4"/><line x1="9.5" y1="1" x2="9.5" y2="4"/></svg>`;
+
+function fmtDate(iso) {
+  if (!iso) return "";
+  const [y, m, d] = iso.split("-").map(Number);
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const curYear = new Date().getFullYear();
+  return y === curYear ? `${months[m-1]} ${d}` : `${months[m-1]} ${d}, ${y}`;
+}
+
+function renderDueDateBtn(key, dateStr) {
+  const wrap = document.getElementById("duedate-wrap");
+  if (!wrap) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const isEmpty = !dateStr;
+  const isOverdue = !isEmpty && dateStr < today;
+  const label = isEmpty ? "No due date" : fmtDate(dateStr);
+  wrap.innerHTML = `<button class="duedate-btn${isOverdue ? " overdue" : ""}" id="duedate-btn" title="Set due date">
+    ${_CAL_ICON}
+    <span style="${isEmpty ? "color:var(--muted)" : ""}">${fmt(label)}</span>
+    <span class="duedate-btn-chevron">▼</span>
+    <input type="date" class="duedate-input" id="duedate-input" value="${fmt(dateStr)}">
+  </button>`;
+  const btn = document.getElementById("duedate-btn");
+  const input = document.getElementById("duedate-input");
+  btn.addEventListener("click", e => {
+    e.stopPropagation();
+    try { input.showPicker(); } catch { input.click(); }
+  });
+  input.addEventListener("change", () => doDueDateChange(key, input.value || null));
+}
+
+async function doDueDateChange(key, dateStr) {
+  renderDueDateBtn(key, dateStr || "");
+  try {
+    await api(`/api/ticket/${encodeURIComponent(key)}/duedate`, {body: {date: dateStr || ""}});
+    toast(dateStr ? `Due date set to ${fmtDate(dateStr)}` : "Due date cleared");
+  } catch (e) {
+    toast(e.message || "Failed to update due date", true);
+    renderDueDateBtn(key, "");
+  }
+}
+
 function renderDetailBody(ticket, children) {
   // Header
   $("#dp-summary").textContent = ticket.summary || "";
@@ -3231,6 +3305,7 @@ function renderDetailBody(ticket, children) {
   renderPriorityBtn(ticket.key, priority);
   const assignee = ticket.values?.assignee;
   renderAssigneeBtn(ticket.key, assignee);
+  renderDueDateBtn(ticket.key, ticket.duedate || "");
   const base = ticket.jira_base_url || STATE.jiraBase;
   $("#dp-jira-link").href = base ? `${base}/browse/${encodeURIComponent(ticket.key)}` : "#";
 
