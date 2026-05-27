@@ -176,8 +176,8 @@ def create_app(store: ConfigStore) -> Flask:
         for c in raw:
             author = c.get("author") or {}
             adf = c.get("body") or {}
-            created = (c.get("created") or "")[:10]
-            updated = (c.get("updated") or "")[:10]
+            created = (c.get("created") or "")
+            updated = (c.get("updated") or "")
             comments.append({
                 "id": c.get("id"),
                 "author": author.get("displayName") or author.get("emailAddress") or "Unknown",
@@ -2328,6 +2328,12 @@ DASHBOARD_HTML = r"""<!doctype html>
 <script>
 const $ = sel => document.querySelector(sel);
 const fmt = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function fmtCommentDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (isNaN(d)) return iso;
+  return d.toLocaleString(undefined, {year:"numeric",month:"long",day:"numeric",hour:"numeric",minute:"2-digit"});
+}
 const PROFILE_URL = "{{ profile_url }}";
 
 let CURRENT_USER = null;
@@ -3399,7 +3405,7 @@ function renderComments(key, comments) {
         <div class="detail-comment-body">
           <div class="detail-comment-meta">
             <span class="detail-comment-author">${fmt(c.author)}</span>
-            <span class="detail-comment-date">${fmt(c.created)}</span>
+            <span class="detail-comment-date">${fmt(fmtCommentDate(c.created))}</span>
             ${c.edited ? `<span class="comment-edited">(edited)</span>` : ""}
           </div>
           <div class="detail-comment-text" data-body-text="${fmt(c.body_text)}">${c.body_html}</div>
