@@ -8,6 +8,24 @@ class JiraConfigError(Exception):
     """Raised when Jira credentials are missing or invalid."""
 
 
+def _format_jira_error(resp: requests.Response) -> str:
+    """Turn a Jira error response into a human-readable message.
+
+    Jira returns {"errorMessages": [...], "errors": {"<fieldId>": "<msg>"}}.
+    Surface both so the actual failing field/validator is visible instead of
+    a raw JSON dump.
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        return f"Jira rejected request: {resp.text[:300]}"
+    parts = list(data.get("errorMessages") or [])
+    for field_id, msg in (data.get("errors") or {}).items():
+        parts.append(f"{field_id}: {msg}")
+    detail = "; ".join(parts) if parts else (resp.text[:300] or f"HTTP {resp.status_code}")
+    return f"Jira rejected request: {detail}"
+
+
 class JiraClient:
     def __init__(self, base_url: str, email: str, api_token: str, verbose: bool = False):
         if not (base_url and email and api_token):
@@ -34,7 +52,7 @@ class JiraClient:
         self._log(f"GET {url} params={params}")
         resp = self._session.get(url, params=params or None)
         if resp.status_code == 400:
-            raise ValueError(f"Jira rejected request: {resp.text[:300]}")
+            raise ValueError(_format_jira_error(resp))
         if resp.status_code == 401:
             raise JiraConfigError("Jira auth failed (401) — check email and API token.")
         if resp.status_code == 403:
@@ -81,7 +99,7 @@ class JiraClient:
         self._log(f"POST {url}")
         resp = self._session.post(url, json=payload)
         if resp.status_code == 400:
-            raise ValueError(f"Jira rejected request: {resp.text[:300]}")
+            raise ValueError(_format_jira_error(resp))
         if resp.status_code == 401:
             raise JiraConfigError("Jira auth failed (401) — check email and API token.")
         if resp.status_code == 403:
@@ -103,18 +121,21 @@ class JiraClient:
         self._put(f"comment/{comment_id}/properties/{key}", value)
 
     def get_transitions(self, issue_key: str) -> list[dict]:
-        data = self._get(f"issue/{issue_key}/transitions")
+        data = self._get(f"issue/{issue_key}/transitions", expand="transitions.fields")
         return data.get("transitions", [])
 
-    def do_transition(self, issue_key: str, transition_id: str) -> None:
-        self._post(f"issue/{issue_key}/transitions", {"transition": {"id": transition_id}})
+    def do_transition(self, issue_key: str, transition_id: str, fields: dict | None = None) -> None:
+        payload: dict = {"transition": {"id": transition_id}}
+        if fields:
+            payload["fields"] = fields
+        self._post(f"issue/{issue_key}/transitions", payload)
 
     def _put(self, path: str, payload: dict) -> dict:
         url = self._url(path)
         self._log(f"PUT {url}")
         resp = self._session.put(url, json=payload)
         if resp.status_code == 400:
-            raise ValueError(f"Jira rejected request: {resp.text[:300]}")
+            raise ValueError(_format_jira_error(resp))
         if resp.status_code == 401:
             raise JiraConfigError("Jira auth failed (401) — check email and API token.")
         if resp.status_code == 403:
