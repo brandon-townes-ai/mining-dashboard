@@ -34,6 +34,43 @@ class ClientHolder:
             return self._client
 
 
+def _get_iap_email(req) -> str:
+    """Extract the real user email from the IAP-injected header."""
+    header = req.headers.get("X-Goog-Authenticated-User-Email", "")
+    return header.removeprefix("accounts.google.com:")
+
+
+_user_cache: dict = {}  # keyed by email — shared lookup cache across requests
+
+
+def _get_request_user(req, client) -> dict | None:
+    """Return {email, name, accountId, avatar} for the IAP-authenticated user, or None."""
+    email = _get_iap_email(req)
+    if not email:
+        return None
+    if email not in _user_cache:
+        jira_user = client.search_user(email)
+        _user_cache[email] = {
+            "email": email,
+            "accountId": jira_user.get("accountId", ""),
+            "name": jira_user.get("displayName", "") or email.split("@")[0],
+            "avatar": (jira_user.get("avatarUrls") or {}).get("24x24", ""),
+        }
+    return _user_cache[email]
+
+
+def _extract_comment_property(comment: dict, key: str) -> dict | None:
+    """Extract a named property value from a Jira comment's expanded properties.
+
+    Jira Cloud returns expanded comment properties as a flat list of
+    {"key": ..., "value": ...} objects.
+    """
+    for prop in comment.get("properties") or []:
+        if isinstance(prop, dict) and prop.get("key") == key:
+            return prop.get("value")
+    return None
+
+
 def create_app(store: ConfigStore) -> Flask:
     app = Flask(__name__, static_folder=str(_STATIC_DIR))
     holder = ClientHolder()
@@ -44,12 +81,15 @@ def create_app(store: ConfigStore) -> Flask:
 
     @app.errorhandler(ValueError)
     def _value_err(exc):
+        # Log so Jira rejections (e.g. missing transition fields/validators) are
+        # diagnosable server-side, not only shown in the client toast.
+        app.logger.warning("%s %s -> %s", request.method, request.path, exc)
         return jsonify({"error": str(exc), "code": "bad_request"}), 400
 
     @app.get("/")
     def index():
         version = os.environ.get("APP_VERSION", _APP_VERSION)
-        email = os.environ.get("JIRA_EMAIL", "")
+        email = _get_iap_email(request) or os.environ.get("JIRA_EMAIL", "")
         user_id = email.split("@")[0] if "@" in email else ""
         profile_url = (
             f"https://anaheim.applied.co/anaheim/appliedistan/about?userId={user_id}"
@@ -154,19 +194,23 @@ def create_app(store: ConfigStore) -> Flask:
             "values": values,
         })
 
-    _me_cache: dict = {}
+    _svc_me_cache: dict = {}  # local dev fallback: caches service account identity
 
     @app.get("/api/me")
     def api_me():
-        if not _me_cache:
-            client = holder.get()
-            me = client.verify_auth()
-            _me_cache.update({
+        user = _get_request_user(request, holder.get())
+        if user:
+            return jsonify(user)
+        # Local dev fallback: return service account identity
+        if not _svc_me_cache:
+            me = holder.get().verify_auth()
+            _svc_me_cache.update({
+                "email": me.get("emailAddress", ""),
                 "accountId": me.get("accountId", ""),
                 "name": me.get("displayName", ""),
                 "avatar": (me.get("avatarUrls") or {}).get("24x24", ""),
             })
-        return jsonify(dict(_me_cache))
+        return jsonify(dict(_svc_me_cache))
 
     @app.get("/api/ticket/<issue_key>/comments")
     def api_ticket_comments(issue_key: str):
@@ -178,11 +222,21 @@ def create_app(store: ConfigStore) -> Flask:
             adf = c.get("body") or {}
             created = (c.get("created") or "")
             updated = (c.get("updated") or "")
+            # Use real-author property if stored (set when comment was posted via dashboard)
+            real_author = _extract_comment_property(c, "real-author")
+            if real_author:
+                display_author = real_author.get("name") or real_author.get("email") or "Unknown"
+                author_id = real_author.get("accountId", "")
+                avatar = real_author.get("avatar") or (author.get("avatarUrls") or {}).get("24x24")
+            else:
+                display_author = author.get("displayName") or author.get("emailAddress") or "Unknown"
+                author_id = author.get("accountId", "")
+                avatar = (author.get("avatarUrls") or {}).get("24x24")
             comments.append({
                 "id": c.get("id"),
-                "author": author.get("displayName") or author.get("emailAddress") or "Unknown",
-                "author_id": author.get("accountId", ""),
-                "avatar": (author.get("avatarUrls") or {}).get("24x24"),
+                "author": display_author,
+                "author_id": author_id,
+                "avatar": avatar,
                 "body_html": _adf_to_html(adf),
                 "body_text": _adf_to_text(adf).strip(),
                 "created": created,
@@ -198,7 +252,17 @@ def create_app(store: ConfigStore) -> Flask:
         if not segments and not text:
             return jsonify({"error": "comment text is required"}), 400
         client = holder.get()
-        client.add_comment(issue_key, text=text, segments=segments or None)
+        new_comment = client.add_comment(issue_key, text=text, segments=segments or None)
+        comment_id = new_comment.get("id")
+        if comment_id:
+            real_user = _get_request_user(request, client)
+            if real_user:
+                try:
+                    client.set_comment_property(comment_id, "real-author", real_user)
+                except Exception as exc:
+                    # Non-fatal: comment is posted; attribution is best-effort.
+                    # Log so silent attribution failures are diagnosable.
+                    app.logger.warning("failed to set real-author on comment %s: %s", comment_id, exc)
         return jsonify({"ok": True})
 
     @app.put("/api/ticket/<issue_key>/comment/<comment_id>")
@@ -225,11 +289,30 @@ def create_app(store: ConfigStore) -> Flask:
         transitions = []
         for t in raw:
             to = t.get("to") or {}
+            # Render every field on the transition screen, not just those flagged
+            # required: some fields are required by a workflow *validator* (which
+            # reports a top-level errorMessage, not a field-level required flag),
+            # e.g. "Reason to Not Fix" on a Rejected transition.
+            screen_fields = []
+            for field_id, meta in (t.get("fields") or {}).items():
+                schema = meta.get("schema") or {}
+                allowed = [
+                    {"id": v.get("id"), "label": v.get("value") or v.get("name") or ""}
+                    for v in (meta.get("allowedValues") or [])
+                ]
+                screen_fields.append({
+                    "id": field_id,
+                    "name": meta.get("name") or field_id,
+                    "type": schema.get("type") or "string",
+                    "required": bool(meta.get("required")),
+                    "allowed_values": allowed,
+                })
             transitions.append({
                 "id": t.get("id"),
                 "name": t.get("name") or "",
                 "to_name": to.get("name") or "",
                 "to_category": (to.get("statusCategory") or {}).get("key") or "undefined",
+                "fields": screen_fields,
             })
         return jsonify({"transitions": transitions})
 
@@ -239,8 +322,9 @@ def create_app(store: ConfigStore) -> Flask:
         transition_id = (body.get("transition_id") or "").strip()
         if not transition_id:
             return jsonify({"error": "transition_id is required"}), 400
+        fields = body.get("fields") or None
         client = holder.get()
-        client.do_transition(issue_key, transition_id)
+        client.do_transition(issue_key, transition_id, fields=fields)
         return jsonify({"ok": True})
 
     @app.get("/api/jira/priorities")
@@ -2087,6 +2171,24 @@ DASHBOARD_HTML = r"""<!doctype html>
   .transition-item-name { flex: 1; }
   .transition-arrow { color: var(--muted); font-size: 10px; flex-shrink: 0; }
 
+  .transition-fields-form { display: flex; flex-direction: column; gap: 8px; padding: 12px 14px; }
+  .transition-fields-title { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 2px; }
+  .transition-field-label { font-size: 11px; color: var(--muted); }
+  .transition-field-req { color: var(--blocked); }
+  .transition-field-input {
+    background: var(--bg); border: 1px solid var(--border); border-radius: var(--r-sm);
+    padding: 6px 8px; font: inherit; font-size: 13px; color: var(--text); width: 100%;
+  }
+  .transition-field-input:focus { outline: none; border-color: var(--accent); }
+  .transition-fields-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 4px; }
+  .transition-fields-submit, .transition-fields-cancel {
+    border: none; border-radius: var(--r-sm); padding: 6px 12px; cursor: pointer; font: inherit; font-size: 12px;
+  }
+  .transition-fields-submit { background: var(--accent); color: #fff; }
+  .transition-fields-submit:hover { opacity: 0.85; }
+  .transition-fields-cancel { background: none; color: var(--muted); }
+  .transition-fields-cancel:hover { color: var(--text); }
+
   tr[data-key] { cursor: pointer; }
   tr.detail-active td { box-shadow: inset 2px 0 0 var(--accent); background: var(--sb-item-active); }
   tr.detail-active:hover td { background: var(--sb-item-active); }
@@ -2932,8 +3034,8 @@ function toggleTransitionsMenu(key) {
       menu.innerHTML = `<div class="transition-item" style="color:var(--muted);cursor:default">No transitions available</div>`;
       return;
     }
-    menu.innerHTML = transitions.map(t =>
-      `<div class="transition-item" data-id="${fmt(t.id)}" data-name="${fmt(t.to_name)}" data-cat="${fmt(t.to_category)}">
+    menu.innerHTML = transitions.map((t, i) =>
+      `<div class="transition-item" data-idx="${i}">
         <span class="transition-item-name">${fmt(t.name)}</span>
         <span class="transition-arrow">→</span>
         <span class="badge cat-${fmt(t.to_category || "undefined")}">${fmt(t.to_name)}</span>
@@ -2941,7 +3043,12 @@ function toggleTransitionsMenu(key) {
     ).join("");
     menu.querySelectorAll(".transition-item").forEach(item => {
       item.addEventListener("click", () => {
-        doTransition(key, item.dataset.id, item.dataset.name, item.dataset.cat);
+        const t = transitions[Number(item.dataset.idx)];
+        if (t.fields && t.fields.length) {
+          promptTransitionFields(key, t);
+        } else {
+          doTransition(key, t.id, t.to_name, t.to_category);
+        }
       });
     });
   }).catch(() => {
@@ -2951,6 +3058,10 @@ function toggleTransitionsMenu(key) {
 
   setTimeout(() => {
     document.addEventListener("click", function handler(e) {
+      // Ignore clicks whose target was detached by a re-render (e.g. picking a
+      // transition that swaps the menu to a required-fields form). Such a target
+      // has no ancestors, so closest() would wrongly report an "outside" click.
+      if (!e.target.isConnected) return;
       if (!e.target.closest(".detail-status-wrap")) {
         closeTransitionsMenu();
         document.removeEventListener("click", handler);
@@ -2959,13 +3070,66 @@ function toggleTransitionsMenu(key) {
   }, 0);
 }
 
-async function doTransition(key, transitionId, toName, toCategory) {
+// Render an inline form to collect a transition's required fields, then submit.
+function promptTransitionFields(key, t) {
+  const menu = $("#transitions-menu");
+  if (!menu) return;
+  const fieldsHtml = t.fields.map((f, i) => {
+    const reqAttr = f.required ? ' data-required="1"' : '';
+    const reqMark = f.required ? ' <span class="transition-field-req">*</span>' : '';
+    const input = (f.allowed_values && f.allowed_values.length)
+      ? `<select class="transition-field-input" data-field-id="${fmt(f.id)}" data-field-type="${fmt(f.type)}"${reqAttr}>
+           <option value="">— select —</option>
+           ${f.allowed_values.map(v => `<option value="${fmt(v.id)}">${fmt(v.label)}</option>`).join("")}
+         </select>`
+      : `<input class="transition-field-input" type="text" data-field-id="${fmt(f.id)}" data-field-type="${fmt(f.type)}"${reqAttr} placeholder="${fmt(f.name)}">`;
+    return `<label class="transition-field-label">${fmt(f.name)}${reqMark}</label>${input}`;
+  }).join("");
+
+  menu.innerHTML = `
+    <div class="transition-fields-form">
+      <div class="transition-fields-title">${fmt(t.name)} → ${fmt(t.to_name)}</div>
+      ${fieldsHtml}
+      <div class="transition-fields-actions">
+        <button class="transition-fields-cancel" type="button">Cancel</button>
+        <button class="transition-fields-submit" type="button">Submit</button>
+      </div>
+    </div>`;
+
+  menu.querySelector(".transition-fields-cancel")
+    .addEventListener("click", () => closeTransitionsMenu());
+
+  menu.querySelector(".transition-fields-submit").addEventListener("click", () => {
+    const fields = {};
+    let missingRequired = false;
+    menu.querySelectorAll(".transition-field-input").forEach(inp => {
+      const id = inp.dataset.fieldId;
+      const type = inp.dataset.fieldType;
+      const val = (inp.value || "").trim();
+      if (!val) {
+        if (inp.dataset.required) missingRequired = true;
+        return;  // omit empty optional fields from the payload
+      }
+      if (inp.tagName === "SELECT") {
+        fields[id] = type === "array" ? [{id: val}] : {id: val};
+      } else {
+        fields[id] = val;
+      }
+    });
+    if (missingRequired) { toast("Please fill in all required fields", true); return; }
+    doTransition(key, t.id, t.to_name, t.to_category, fields);
+  });
+}
+
+async function doTransition(key, transitionId, toName, toCategory, fields) {
   closeTransitionsMenu();
   const el = $("#dp-status");
   const prev = el ? el.innerHTML : "";
   if (el) el.innerHTML = `<span class="badge cat-${fmt(toCategory || "undefined")}" style="opacity:0.5">${fmt(toName)}</span>`;
   try {
-    await api(`/api/ticket/${encodeURIComponent(key)}/transition`, {body: {transition_id: transitionId}});
+    const body = {transition_id: transitionId};
+    if (fields && Object.keys(fields).length) body.fields = fields;
+    await api(`/api/ticket/${encodeURIComponent(key)}/transition`, {body});
     // Update header badge fully
     if (el) el.innerHTML = `<button class="status-btn" id="status-transition-btn" title="Change status">
       <span class="badge cat-${fmt(toCategory || "undefined")}">${fmt(toName)}</span>
