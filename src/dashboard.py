@@ -300,11 +300,17 @@ def create_app(store: ConfigStore) -> Flask:
                     {"id": v.get("id"), "label": v.get("value") or v.get("name") or ""}
                     for v in (meta.get("allowedValues") or [])
                 ]
+                # Rich-text fields must be sent as Atlassian Document Format (ADF)
+                # objects on the v3 API, not plain strings: textarea custom fields
+                # and the description/environment system fields.
+                custom = schema.get("custom") or ""
+                is_adf = custom.endswith(":textarea") or field_id in ("description", "environment")
                 screen_fields.append({
                     "id": field_id,
                     "name": meta.get("name") or field_id,
                     "type": schema.get("type") or "string",
                     "required": bool(meta.get("required")),
+                    "adf": is_adf,
                     "allowed_values": allowed,
                 })
             transitions.append({
@@ -3076,13 +3082,14 @@ function promptTransitionFields(key, t) {
   if (!menu) return;
   const fieldsHtml = t.fields.map((f, i) => {
     const reqAttr = f.required ? ' data-required="1"' : '';
+    const adfAttr = f.adf ? ' data-adf="1"' : '';
     const reqMark = f.required ? ' <span class="transition-field-req">*</span>' : '';
     const input = (f.allowed_values && f.allowed_values.length)
       ? `<select class="transition-field-input" data-field-id="${fmt(f.id)}" data-field-type="${fmt(f.type)}"${reqAttr}>
            <option value="">— select —</option>
            ${f.allowed_values.map(v => `<option value="${fmt(v.id)}">${fmt(v.label)}</option>`).join("")}
          </select>`
-      : `<input class="transition-field-input" type="text" data-field-id="${fmt(f.id)}" data-field-type="${fmt(f.type)}"${reqAttr} placeholder="${fmt(f.name)}">`;
+      : `<input class="transition-field-input" type="text" data-field-id="${fmt(f.id)}" data-field-type="${fmt(f.type)}"${reqAttr}${adfAttr} placeholder="${fmt(f.name)}">`;
     return `<label class="transition-field-label">${fmt(f.name)}${reqMark}</label>${input}`;
   }).join("");
 
@@ -3112,6 +3119,10 @@ function promptTransitionFields(key, t) {
       }
       if (inp.tagName === "SELECT") {
         fields[id] = type === "array" ? [{id: val}] : {id: val};
+      } else if (inp.dataset.adf) {
+        // Rich-text fields require Atlassian Document Format on the v3 API.
+        fields[id] = {version: 1, type: "doc",
+          content: [{type: "paragraph", content: [{type: "text", text: val}]}]};
       } else {
         fields[id] = val;
       }
