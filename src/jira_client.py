@@ -92,8 +92,15 @@ class JiraClient:
         return resp.json() if resp.content else {}
 
     def get_comments(self, issue_key: str, max_results: int = 50) -> list[dict]:
-        data = self._get(f"issue/{issue_key}/comment", maxResults=max_results, orderBy="-created")
+        data = self._get(f"issue/{issue_key}/comment", maxResults=max_results, orderBy="-created", expand="properties")
         return data.get("comments", [])
+
+    def search_user(self, email: str) -> dict:
+        results = self._get("user/search", query=email, maxResults=1)
+        return results[0] if results else {}  # type: ignore[index]
+
+    def set_comment_property(self, comment_id: str, key: str, value: dict) -> None:
+        self._put(f"comment/{comment_id}/properties/{key}", value)
 
     def get_transitions(self, issue_key: str) -> list[dict]:
         data = self._get(f"issue/{issue_key}/transitions")

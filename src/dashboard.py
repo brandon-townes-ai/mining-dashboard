@@ -34,6 +34,43 @@ class ClientHolder:
             return self._client
 
 
+def _get_iap_email(req) -> str:
+    """Extract the real user email from the IAP-injected header."""
+    header = req.headers.get("X-Goog-Authenticated-User-Email", "")
+    return header.removeprefix("accounts.google.com:")
+
+
+_user_cache: dict = {}  # keyed by email — shared lookup cache across requests
+
+
+def _get_request_user(req, client) -> dict | None:
+    """Return {email, name, accountId, avatar} for the IAP-authenticated user, or None."""
+    email = _get_iap_email(req)
+    if not email:
+        return None
+    if email not in _user_cache:
+        jira_user = client.search_user(email)
+        _user_cache[email] = {
+            "email": email,
+            "accountId": jira_user.get("accountId", ""),
+            "name": jira_user.get("displayName", "") or email.split("@")[0],
+            "avatar": (jira_user.get("avatarUrls") or {}).get("24x24", ""),
+        }
+    return _user_cache[email]
+
+
+def _extract_comment_property(comment: dict, key: str) -> dict | None:
+    """Extract a named property value from a Jira comment's expanded properties.
+
+    Jira Cloud returns expanded comment properties as a flat list of
+    {"key": ..., "value": ...} objects.
+    """
+    for prop in comment.get("properties") or []:
+        if isinstance(prop, dict) and prop.get("key") == key:
+            return prop.get("value")
+    return None
+
+
 def create_app(store: ConfigStore) -> Flask:
     app = Flask(__name__, static_folder=str(_STATIC_DIR))
     holder = ClientHolder()
@@ -49,7 +86,7 @@ def create_app(store: ConfigStore) -> Flask:
     @app.get("/")
     def index():
         version = os.environ.get("APP_VERSION", _APP_VERSION)
-        email = os.environ.get("JIRA_EMAIL", "")
+        email = _get_iap_email(request) or os.environ.get("JIRA_EMAIL", "")
         user_id = email.split("@")[0] if "@" in email else ""
         profile_url = (
             f"https://anaheim.applied.co/anaheim/appliedistan/about?userId={user_id}"
@@ -154,19 +191,23 @@ def create_app(store: ConfigStore) -> Flask:
             "values": values,
         })
 
-    _me_cache: dict = {}
+    _svc_me_cache: dict = {}  # local dev fallback: caches service account identity
 
     @app.get("/api/me")
     def api_me():
-        if not _me_cache:
-            client = holder.get()
-            me = client.verify_auth()
-            _me_cache.update({
+        user = _get_request_user(request, holder.get())
+        if user:
+            return jsonify(user)
+        # Local dev fallback: return service account identity
+        if not _svc_me_cache:
+            me = holder.get().verify_auth()
+            _svc_me_cache.update({
+                "email": me.get("emailAddress", ""),
                 "accountId": me.get("accountId", ""),
                 "name": me.get("displayName", ""),
                 "avatar": (me.get("avatarUrls") or {}).get("24x24", ""),
             })
-        return jsonify(dict(_me_cache))
+        return jsonify(dict(_svc_me_cache))
 
     @app.get("/api/ticket/<issue_key>/comments")
     def api_ticket_comments(issue_key: str):
@@ -178,11 +219,21 @@ def create_app(store: ConfigStore) -> Flask:
             adf = c.get("body") or {}
             created = (c.get("created") or "")
             updated = (c.get("updated") or "")
+            # Use real-author property if stored (set when comment was posted via dashboard)
+            real_author = _extract_comment_property(c, "real-author")
+            if real_author:
+                display_author = real_author.get("name") or real_author.get("email") or "Unknown"
+                author_id = real_author.get("accountId", "")
+                avatar = real_author.get("avatar") or (author.get("avatarUrls") or {}).get("24x24")
+            else:
+                display_author = author.get("displayName") or author.get("emailAddress") or "Unknown"
+                author_id = author.get("accountId", "")
+                avatar = (author.get("avatarUrls") or {}).get("24x24")
             comments.append({
                 "id": c.get("id"),
-                "author": author.get("displayName") or author.get("emailAddress") or "Unknown",
-                "author_id": author.get("accountId", ""),
-                "avatar": (author.get("avatarUrls") or {}).get("24x24"),
+                "author": display_author,
+                "author_id": author_id,
+                "avatar": avatar,
                 "body_html": _adf_to_html(adf),
                 "body_text": _adf_to_text(adf).strip(),
                 "created": created,
@@ -198,7 +249,17 @@ def create_app(store: ConfigStore) -> Flask:
         if not segments and not text:
             return jsonify({"error": "comment text is required"}), 400
         client = holder.get()
-        client.add_comment(issue_key, text=text, segments=segments or None)
+        new_comment = client.add_comment(issue_key, text=text, segments=segments or None)
+        comment_id = new_comment.get("id")
+        if comment_id:
+            real_user = _get_request_user(request, client)
+            if real_user:
+                try:
+                    client.set_comment_property(comment_id, "real-author", real_user)
+                except Exception as exc:
+                    # Non-fatal: comment is posted; attribution is best-effort.
+                    # Log so silent attribution failures are diagnosable.
+                    app.logger.warning("failed to set real-author on comment %s: %s", comment_id, exc)
         return jsonify({"ok": True})
 
     @app.put("/api/ticket/<issue_key>/comment/<comment_id>")
