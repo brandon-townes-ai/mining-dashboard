@@ -8,6 +8,12 @@ class JiraConfigError(Exception):
     """Raised when Jira credentials are missing or invalid."""
 
 
+def _text_to_adf(text: str) -> dict:
+    """Wrap plain text as an Atlassian Document Format doc (required on v3)."""
+    return {"version": 1, "type": "doc",
+            "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}
+
+
 def _format_jira_error(resp: requests.Response) -> str:
     """Turn a Jira error response into a human-readable message.
 
@@ -124,10 +130,22 @@ class JiraClient:
         data = self._get(f"issue/{issue_key}/transitions", expand="transitions.fields")
         return data.get("transitions", [])
 
-    def do_transition(self, issue_key: str, transition_id: str, fields: dict | None = None) -> None:
+    def do_transition(self, issue_key: str, transition_id: str, fields: dict | None = None,
+                      comment: str | dict | None = None) -> None:
         payload: dict = {"transition": {"id": transition_id}}
+        fields = dict(fields) if fields else {}
+        # A comment is never settable through `fields` — Jira requires it in the
+        # `update` section as an `add` op with an ADF body. Some workflows enforce
+        # a comment via a validator that is NOT advertised in the transition
+        # metadata (no `comment` field, not flagged required); it surfaces only as
+        # a "Please Enter Comment" error on POST. Accept a comment from either the
+        # dedicated arg or a stray `comment` screen field and route it correctly.
+        comment = comment or fields.pop("comment", None)
         if fields:
             payload["fields"] = fields
+        if comment:
+            body = comment if isinstance(comment, dict) else _text_to_adf(comment)
+            payload["update"] = {"comment": [{"add": {"body": body}}]}
         self._post(f"issue/{issue_key}/transitions", payload)
 
     def _put(self, path: str, payload: dict) -> dict:

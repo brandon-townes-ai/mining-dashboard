@@ -39,4 +39,6 @@ app = create_app(store)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5001))
-    app.run(host="0.0.0.0", port=port, debug=os.environ.get("ENV") == "dev", use_reloader=False)
+    is_dev = os.environ.get("ENV") == "dev"
+    # In dev, watch source files and auto-restart on save (hot reload).
+    app.run(host="0.0.0.0", port=port, debug=is_dev, use_reloader=is_dev)

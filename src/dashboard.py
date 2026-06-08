@@ -329,8 +329,9 @@ def create_app(store: ConfigStore) -> Flask:
         if not transition_id:
             return jsonify({"error": "transition_id is required"}), 400
         fields = body.get("fields") or None
+        comment = (body.get("comment") or "").strip() or None
         client = holder.get()
-        client.do_transition(issue_key, transition_id, fields=fields)
+        client.do_transition(issue_key, transition_id, fields=fields, comment=comment)
         return jsonify({"ok": True})
 
     @app.get("/api/jira/priorities")
@@ -2916,12 +2917,21 @@ function renderStaleCallout(items, jiraBase) {
     return `<div class="stale-item">
       <span class="stale-idle-tag">${fmt(idleLabel(item.updated))}</span>
       ${prioBadge}
-      <a class="stale-item-key" href="${fmt(url)}" target="_blank" rel="noopener">${fmt(item.key)}</a>
+      <a class="stale-item-key" href="${fmt(url)}" data-key="${fmt(item.key)}" rel="noopener">${fmt(item.key)}</a>
       <span class="stale-item-summary" title="${fmt(item.summary)}">${fmt(item.summary)}</span>
       ${assignee}
       ${parent}
     </div>`;
   }).join("");
+  // Open the ticket in the side panel on plain click; keep modifier/middle
+  // clicks opening Jira in a new tab (the href is preserved as a fallback).
+  $("#stale-callout-body").querySelectorAll(".stale-item-key").forEach(a => {
+    a.addEventListener("click", e => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;
+      e.preventDefault();
+      openDetailPanel(a.dataset.key);
+    });
+  });
 }
 
 function scheduleRefresh() {
@@ -3132,7 +3142,7 @@ function promptTransitionFields(key, t) {
   });
 }
 
-async function doTransition(key, transitionId, toName, toCategory, fields) {
+async function doTransition(key, transitionId, toName, toCategory, fields, comment) {
   closeTransitionsMenu();
   const el = $("#dp-status");
   const prev = el ? el.innerHTML : "";
@@ -3140,6 +3150,7 @@ async function doTransition(key, transitionId, toName, toCategory, fields) {
   try {
     const body = {transition_id: transitionId};
     if (fields && Object.keys(fields).length) body.fields = fields;
+    if (comment) body.comment = comment;
     await api(`/api/ticket/${encodeURIComponent(key)}/transition`, {body});
     // Update header badge fully
     if (el) el.innerHTML = `<button class="status-btn" id="status-transition-btn" title="Change status">
@@ -3156,8 +3167,46 @@ async function doTransition(key, transitionId, toName, toCategory, fields) {
     toast(`Status → ${toName}`);
   } catch (e) {
     if (el) el.innerHTML = prev;
+    // Some workflows require a comment via a validator that Jira does not
+    // advertise in the transition metadata — it only rejects on POST with
+    // "Please Enter Comment". When that happens and we haven't already supplied
+    // one, prompt for a comment and retry the same transition.
+    if (!comment && /comment/i.test(e.message || "")) {
+      promptTransitionComment(key, transitionId, toName, toCategory, fields);
+      return;
+    }
     toast(e.message || "Transition failed", true);
   }
+}
+
+// Prompt for a required comment (workflow validator) and retry the transition.
+function promptTransitionComment(key, transitionId, toName, toCategory, fields) {
+  const menu = $("#transitions-menu");
+  const btn = document.getElementById("status-transition-btn");
+  if (!menu) return;
+  menu.innerHTML = `
+    <div class="transition-fields-form">
+      <div class="transition-fields-title">${fmt(toName)} — comment required</div>
+      <label class="transition-field-label">Comment <span class="transition-field-req">*</span></label>
+      <input class="transition-field-input" id="transition-comment-input" type="text" placeholder="Enter comment">
+      <div class="transition-fields-actions">
+        <button class="transition-fields-cancel" type="button">Cancel</button>
+        <button class="transition-fields-submit" type="button">Submit</button>
+      </div>
+    </div>`;
+  menu.classList.add("open");
+  if (btn) btn.classList.add("open");
+  const input = menu.querySelector("#transition-comment-input");
+  if (input) input.focus();
+  menu.querySelector(".transition-fields-cancel")
+    .addEventListener("click", () => closeTransitionsMenu());
+  const submit = () => {
+    const val = (input.value || "").trim();
+    if (!val) { toast("Please enter a comment", true); return; }
+    doTransition(key, transitionId, toName, toCategory, fields, val);
+  };
+  menu.querySelector(".transition-fields-submit").addEventListener("click", submit);
+  if (input) input.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
 }
 
 function updateTableRowStatus(key, toName, toCategory) {
