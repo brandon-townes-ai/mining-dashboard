@@ -2556,11 +2556,12 @@ async function connectJira() {
   if (!url) { toast("Could not start Jira connection", true); return; }
   const popup = window.open(url, "jira-connect", "width=620,height=760");
   // When the OAuth popup closes, re-check connection and refresh the user identity.
-  const timer = setInterval(() => {
+  const timer = setInterval(async () => {
     if (!popup || popup.closed) {
       clearInterval(timer);
+      await loadCurrentUser();
       checkJiraConnection();
-      fetch("/api/me").then(r => r.ok ? r.json() : null).then(d => { CURRENT_USER = d; }).catch(() => {});
+      refreshJiraStatus();
       toast("Jira connected");
     }
   }, 800);
@@ -2573,6 +2574,15 @@ async function checkJiraConnection() {
     if (btn) btn.style.display = (d.available && !d.connected) ? "" : "none";
     return !!d.connected;
   } catch { return false; }
+}
+
+async function loadCurrentUser() {
+  // Raw fetch (not api()) so an unconnected user isn't auto-prompted to connect on load.
+  try {
+    const r = await fetch("/api/me");
+    CURRENT_USER = r.ok ? await r.json() : null;
+  } catch { CURRENT_USER = null; }
+  return CURRENT_USER;
 }
 
 async function api(path, opts={}) {
@@ -4097,28 +4107,39 @@ async function deleteCurrentView() {
 }
 
 async function refreshJiraStatus() {
+  // The connection panel reflects the LOGGED-IN user (their own per-user Jira identity
+  // via the Data API), not the shared read credential. /api/jira/status is used only to
+  // confirm the dashboard can read Jira (health dot + base URL).
+  let s;
   try {
-    const s = await api("/api/jira/status");
-    if (s.ok) {
-      $("#jira-status").innerHTML = `connected to <b>${fmt(s.base_url)}</b> as <b>${fmt(s.user)}</b>`;
-      const dot = $("#jira-dot");
-      if (dot) dot.className = "status-dot ok";
-      const txt = $("#jira-status-text");
-      if (txt) {
-        const name = fmt(s.user);
-        txt.innerHTML = PROFILE_URL
-          ? `by <a class="hero-user-link" href="${fmt(PROFILE_URL)}" target="_blank" rel="noopener">${name}</a>`
-          : `by ${name}`;
-      }
-    } else {
-      $("#jira-status").innerHTML = `<span class="err">${fmt(s.error || "not connected")}</span>`;
-      const dot = $("#jira-dot");
-      if (dot) dot.className = "status-dot err";
-      const txt = $("#jira-status-text");
-      if (txt) txt.textContent = "not connected";
-    }
+    s = await api("/api/jira/status");
   } catch (e) {
     $("#jira-status").innerHTML = `<span class="err">${fmt(e.message)}</span>`;
+    return;
+  }
+  const dot = $("#jira-dot");
+  if (!s.ok) {
+    $("#jira-status").innerHTML = `<span class="err">${fmt(s.error || "cannot reach Jira")}</span>`;
+    if (dot) dot.className = "status-dot err";
+    const txt = $("#jira-status-text");
+    if (txt) txt.textContent = "not connected";
+    return;
+  }
+  if (dot) dot.className = "status-dot ok";
+  const who = (CURRENT_USER && CURRENT_USER.name) ? fmt(CURRENT_USER.name) : "";
+  const txt = $("#jira-status-text");
+  if (who) {
+    $("#jira-status").innerHTML = `connected to <b>${fmt(s.base_url)}</b> as <b>${who}</b>`;
+    if (txt) txt.innerHTML = PROFILE_URL
+      ? `by <a class="hero-user-link" href="${fmt(PROFILE_URL)}" target="_blank" rel="noopener">${who}</a>`
+      : `by ${who}`;
+  } else {
+    // Reads work, but this user hasn't connected their own Jira account yet.
+    $("#jira-status").innerHTML =
+      `connected to <b>${fmt(s.base_url)}</b> — <a href="#" id="jira-status-connect">Connect Jira</a> to act as yourself`;
+    const lnk = $("#jira-status-connect");
+    if (lnk) lnk.addEventListener("click", (e) => { e.preventDefault(); connectJira(); });
+    if (txt) txt.textContent = "not connected";
   }
 }
 
@@ -4216,7 +4237,7 @@ $("#btn-connect-jira")?.addEventListener("click", connectJira);
 applyTheme(getTheme());
 
 (async function init() {
-  fetch("/api/me").then(r => r.ok ? r.json() : null).then(d => { CURRENT_USER = d; }).catch(() => {});
+  await loadCurrentUser();
   checkJiraConnection();
   await loadConfig();
   await refreshJiraStatus();
