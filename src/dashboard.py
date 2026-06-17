@@ -14,6 +14,12 @@ _STATIC_DIR = pathlib.Path(__file__).parent.parent / "static"
 
 from .config import APP_VERSION as _APP_VERSION, ConfigStore
 from .jira_client import JiraClient, JiraConfigError
+from .data_api_jira_client import (
+    DataApiJiraClient,
+    JiraNotConnectedError,
+    start_oauth,
+    list_connections,
+)
 
 
 class ClientHolder:
@@ -40,35 +46,17 @@ def _get_iap_email(req) -> str:
     return header.removeprefix("accounts.google.com:")
 
 
-_user_cache: dict = {}  # keyed by email — shared lookup cache across requests
-
-
-def _get_request_user(req, client) -> dict | None:
-    """Return {email, name, accountId, avatar} for the IAP-authenticated user, or None."""
-    email = _get_iap_email(req)
-    if not email:
-        return None
-    if email not in _user_cache:
-        jira_user = client.search_user(email)
-        _user_cache[email] = {
-            "email": email,
-            "accountId": jira_user.get("accountId", ""),
-            "name": jira_user.get("displayName", "") or email.split("@")[0],
-            "avatar": (jira_user.get("avatarUrls") or {}).get("24x24", ""),
-        }
-    return _user_cache[email]
-
-
-def _extract_comment_property(comment: dict, key: str) -> dict | None:
-    """Extract a named property value from a Jira comment's expanded properties.
-
-    Jira Cloud returns expanded comment properties as a flat list of
-    {"key": ..., "value": ...} objects.
-    """
-    for prop in comment.get("properties") or []:
-        if isinstance(prop, dict) and prop.get("key") == key:
-            return prop.get("value")
-    return None
+def _is_jira_connection(conn: dict) -> bool:
+    """Whether a Data API connection record refers to Jira. The exact key/value the
+    platform uses for Jira is not documented, so match leniently across the likely
+    identifier fields."""
+    if not isinstance(conn, dict):
+        return "jira" in str(conn).lower()
+    blob = " ".join(
+        str(conn.get(k, "")) for k in
+        ("provider", "provider_config_key", "integration", "integration_id", "id", "key")
+    ).lower()
+    return "jira" in blob
 
 
 def create_app(store: ConfigStore) -> Flask:
@@ -85,6 +73,33 @@ def create_app(store: ConfigStore) -> Flask:
         # diagnosable server-side, not only shown in the client toast.
         app.logger.warning("%s %s -> %s", request.method, request.path, exc)
         return jsonify({"error": str(exc), "code": "bad_request"}), 400
+
+    @app.errorhandler(JiraNotConnectedError)
+    def _not_connected_err(exc):
+        # 409 + code lets the frontend prompt "Connect Jira" instead of a generic error.
+        return jsonify({"error": str(exc), "code": "jira_not_connected"}), 409
+
+    def _writer():
+        """Per-request Jira *write* client that acts as the logged-in IAP user.
+
+        Routes writes through the Data API using this request's X-Request-Token
+        (injected by Trident after IAP). Local dev has no Data API (URL_BASE unset):
+        optionally fall back to the shared credential when LOCAL_DEV_FALLBACK_WRITES=1
+        so the UI stays usable; otherwise behave like prod and signal not-connected.
+        """
+        if not os.environ.get("URL_BASE", "").strip():
+            if os.environ.get("LOCAL_DEV_FALLBACK_WRITES") == "1":
+                print("[dev] writing as the shared service account (LOCAL_DEV_FALLBACK_WRITES=1)")
+                return holder.get()
+            raise JiraNotConnectedError(
+                "Per-user Jira writes require the deployed environment "
+                "(set LOCAL_DEV_FALLBACK_WRITES=1 to write as the shared account locally).")
+        token = request.headers.get("X-Request-Token", "")
+        if not token:
+            raise JiraNotConnectedError(
+                "Your Jira identity could not be established for this request. "
+                "Click “Connect Jira” to authorize the dashboard.")
+        return DataApiJiraClient(token)
 
     @app.get("/")
     def index():
@@ -114,6 +129,30 @@ def create_app(store: ConfigStore) -> Flask:
             "base_url": client.base_url,
             "user": me.get("displayName") or me.get("emailAddress"),
         })
+
+    @app.get("/api/jira/connection")
+    def api_jira_connection():
+        token = request.headers.get("X-Request-Token", "")
+        if not token:
+            # No Data API session (e.g. local dev) — nothing to connect.
+            return jsonify({"connected": False, "available": False})
+        try:
+            conns = list_connections(token)
+        except Exception as exc:
+            return jsonify({"connected": False, "available": True, "error": str(exc)})
+        connected = any(_is_jira_connection(c) for c in conns)
+        return jsonify({"connected": connected, "available": True})
+
+    @app.post("/api/jira/connect")
+    def api_jira_connect():
+        token = request.headers.get("X-Request-Token", "")
+        if not token:
+            return jsonify({"error": "No Data API session on this request.",
+                            "code": "no_token"}), 400
+        url = start_oauth(token, "jira")
+        if not url:
+            return jsonify({"error": "Could not start Jira OAuth."}), 502
+        return jsonify({"url": url})
 
     @app.get("/api/views")
     def api_views_list():
@@ -194,23 +233,17 @@ def create_app(store: ConfigStore) -> Flask:
             "values": values,
         })
 
-    _svc_me_cache: dict = {}  # local dev fallback: caches service account identity
-
     @app.get("/api/me")
     def api_me():
-        user = _get_request_user(request, holder.get())
-        if user:
-            return jsonify(user)
-        # Local dev fallback: return service account identity
-        if not _svc_me_cache:
-            me = holder.get().verify_auth()
-            _svc_me_cache.update({
-                "email": me.get("emailAddress", ""),
-                "accountId": me.get("accountId", ""),
-                "name": me.get("displayName", ""),
-                "avatar": (me.get("avatarUrls") or {}).get("24x24", ""),
-            })
-        return jsonify(dict(_svc_me_cache))
+        # The logged-in user's OWN Jira identity (via the Data API), so the
+        # frontend's own-comment Edit/Delete affordance matches the real user.
+        me = _writer().verify_auth()
+        return jsonify({
+            "email": me.get("emailAddress", ""),
+            "accountId": me.get("accountId", ""),
+            "name": me.get("displayName", ""),
+            "avatar": (me.get("avatarUrls") or {}).get("24x24", ""),
+        })
 
     @app.get("/api/ticket/<issue_key>/comments")
     def api_ticket_comments(issue_key: str):
@@ -222,16 +255,9 @@ def create_app(store: ConfigStore) -> Flask:
             adf = c.get("body") or {}
             created = (c.get("created") or "")
             updated = (c.get("updated") or "")
-            # Use real-author property if stored (set when comment was posted via dashboard)
-            real_author = _extract_comment_property(c, "real-author")
-            if real_author:
-                display_author = real_author.get("name") or real_author.get("email") or "Unknown"
-                author_id = real_author.get("accountId", "")
-                avatar = real_author.get("avatar") or (author.get("avatarUrls") or {}).get("24x24")
-            else:
-                display_author = author.get("displayName") or author.get("emailAddress") or "Unknown"
-                author_id = author.get("accountId", "")
-                avatar = (author.get("avatarUrls") or {}).get("24x24")
+            display_author = author.get("displayName") or author.get("emailAddress") or "Unknown"
+            author_id = author.get("accountId", "")
+            avatar = (author.get("avatarUrls") or {}).get("24x24")
             comments.append({
                 "id": c.get("id"),
                 "author": display_author,
@@ -251,18 +277,8 @@ def create_app(store: ConfigStore) -> Flask:
         text = (body.get("text") or "").strip()
         if not segments and not text:
             return jsonify({"error": "comment text is required"}), 400
-        client = holder.get()
-        new_comment = client.add_comment(issue_key, text=text, segments=segments or None)
-        comment_id = new_comment.get("id")
-        if comment_id:
-            real_user = _get_request_user(request, client)
-            if real_user:
-                try:
-                    client.set_comment_property(comment_id, "real-author", real_user)
-                except Exception as exc:
-                    # Non-fatal: comment is posted; attribution is best-effort.
-                    # Log so silent attribution failures are diagnosable.
-                    app.logger.warning("failed to set real-author on comment %s: %s", comment_id, exc)
+        client = _writer()
+        client.add_comment(issue_key, text=text, segments=segments or None)
         return jsonify({"ok": True})
 
     @app.put("/api/ticket/<issue_key>/comment/<comment_id>")
@@ -272,13 +288,13 @@ def create_app(store: ConfigStore) -> Flask:
         text = (body.get("text") or "").strip()
         if not segments and not text:
             return jsonify({"error": "comment text is required"}), 400
-        client = holder.get()
+        client = _writer()
         client.update_comment(issue_key, comment_id, text=text, segments=segments or None)
         return jsonify({"ok": True})
 
     @app.delete("/api/ticket/<issue_key>/comment/<comment_id>")
     def api_ticket_delete_comment(issue_key: str, comment_id: str):
-        client = holder.get()
+        client = _writer()
         client.delete_comment(issue_key, comment_id)
         return jsonify({"ok": True})
 
@@ -330,7 +346,7 @@ def create_app(store: ConfigStore) -> Flask:
             return jsonify({"error": "transition_id is required"}), 400
         fields = body.get("fields") or None
         comment = (body.get("comment") or "").strip() or None
-        client = holder.get()
+        client = _writer()
         client.do_transition(issue_key, transition_id, fields=fields, comment=comment)
         return jsonify({"ok": True})
 
@@ -347,7 +363,7 @@ def create_app(store: ConfigStore) -> Flask:
         priority_name = (body.get("priority_name") or "").strip()
         if not priority_name:
             return jsonify({"error": "priority_name is required"}), 400
-        client = holder.get()
+        client = _writer()
         client.update_priority(issue_key, priority_name)
         return jsonify({"ok": True})
 
@@ -368,14 +384,14 @@ def create_app(store: ConfigStore) -> Flask:
     def api_ticket_set_assignee(issue_key: str):
         body = request.get_json(silent=True) or {}
         account_id = (body.get("account_id") or "").strip() or None
-        holder.get().update_assignee(issue_key, account_id)
+        _writer().update_assignee(issue_key, account_id)
         return jsonify({"ok": True})
 
     @app.post("/api/ticket/<issue_key>/duedate")
     def api_ticket_set_duedate(issue_key: str):
         body = request.get_json(silent=True) or {}
         date_str = (body.get("date") or "").strip() or None
-        holder.get().update_duedate(issue_key, date_str)
+        _writer().update_duedate(issue_key, date_str)
         return jsonify({"ok": True})
 
     @app.get("/api/stale-children")
@@ -2278,6 +2294,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <span class="active-view-label" id="active-view-label"></span>
     <div class="grow"></div>
     <span class="status-chip" id="status">—</span>
+    <button id="btn-connect-jira" class="topbar-btn accent" title="Authorize the dashboard to comment and edit as you in Jira" style="display:none">Connect Jira</button>
     <button id="btn-refresh" class="topbar-btn">↺ Refresh</button>
     <button id="btn-theme" class="topbar-btn" title="Toggle dark mode">🌙</button>
     <button id="btn-settings" class="topbar-btn">⚙ Settings</button>
@@ -2519,6 +2536,55 @@ function toast(msg, err=false) {
   setTimeout(() => el.remove(), 2400);
 }
 
+let CONNECT_PROMPT_OPEN = false;
+function promptConnectJira(msg) {
+  if (CONNECT_PROMPT_OPEN) return;
+  CONNECT_PROMPT_OPEN = true;
+  const go = confirm((msg || "Connect your Jira account to continue.") + "\n\nConnect now?");
+  CONNECT_PROMPT_OPEN = false;
+  if (go) connectJira();
+}
+
+async function connectJira() {
+  let url;
+  try {
+    ({url} = await api("/api/jira/connect", {method: "POST"}));
+  } catch (e) {
+    toast(e.message || "Connect failed", true);
+    return;
+  }
+  if (!url) { toast("Could not start Jira connection", true); return; }
+  const popup = window.open(url, "jira-connect", "width=620,height=760");
+  // When the OAuth popup closes, re-check connection and refresh the user identity.
+  const timer = setInterval(async () => {
+    if (!popup || popup.closed) {
+      clearInterval(timer);
+      await loadCurrentUser();
+      checkJiraConnection();
+      refreshJiraStatus();
+      toast("Jira connected");
+    }
+  }, 800);
+}
+
+async function checkJiraConnection() {
+  try {
+    const d = await api("/api/jira/connection");
+    const btn = $("#btn-connect-jira");
+    if (btn) btn.style.display = (d.available && !d.connected) ? "" : "none";
+    return !!d.connected;
+  } catch { return false; }
+}
+
+async function loadCurrentUser() {
+  // Raw fetch (not api()) so an unconnected user isn't auto-prompted to connect on load.
+  try {
+    const r = await fetch("/api/me");
+    CURRENT_USER = r.ok ? await r.json() : null;
+  } catch { CURRENT_USER = null; }
+  return CURRENT_USER;
+}
+
 async function api(path, opts={}) {
   const r = await fetch(path, {
     headers: opts.body ? {"Content-Type": "application/json"} : {},
@@ -2527,7 +2593,10 @@ async function api(path, opts={}) {
     method: opts.method || (opts.body ? "POST" : "GET"),
   });
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw Object.assign(new Error(data.error || r.statusText), {status: r.status, code: data.code});
+  if (!r.ok) {
+    if (data.code === "jira_not_connected") promptConnectJira(data.error);
+    throw Object.assign(new Error(data.error || r.statusText), {status: r.status, code: data.code});
+  }
   return data;
 }
 
@@ -4038,28 +4107,39 @@ async function deleteCurrentView() {
 }
 
 async function refreshJiraStatus() {
+  // The connection panel reflects the LOGGED-IN user (their own per-user Jira identity
+  // via the Data API), not the shared read credential. /api/jira/status is used only to
+  // confirm the dashboard can read Jira (health dot + base URL).
+  let s;
   try {
-    const s = await api("/api/jira/status");
-    if (s.ok) {
-      $("#jira-status").innerHTML = `connected to <b>${fmt(s.base_url)}</b> as <b>${fmt(s.user)}</b>`;
-      const dot = $("#jira-dot");
-      if (dot) dot.className = "status-dot ok";
-      const txt = $("#jira-status-text");
-      if (txt) {
-        const name = fmt(s.user);
-        txt.innerHTML = PROFILE_URL
-          ? `by <a class="hero-user-link" href="${fmt(PROFILE_URL)}" target="_blank" rel="noopener">${name}</a>`
-          : `by ${name}`;
-      }
-    } else {
-      $("#jira-status").innerHTML = `<span class="err">${fmt(s.error || "not connected")}</span>`;
-      const dot = $("#jira-dot");
-      if (dot) dot.className = "status-dot err";
-      const txt = $("#jira-status-text");
-      if (txt) txt.textContent = "not connected";
-    }
+    s = await api("/api/jira/status");
   } catch (e) {
     $("#jira-status").innerHTML = `<span class="err">${fmt(e.message)}</span>`;
+    return;
+  }
+  const dot = $("#jira-dot");
+  if (!s.ok) {
+    $("#jira-status").innerHTML = `<span class="err">${fmt(s.error || "cannot reach Jira")}</span>`;
+    if (dot) dot.className = "status-dot err";
+    const txt = $("#jira-status-text");
+    if (txt) txt.textContent = "not connected";
+    return;
+  }
+  if (dot) dot.className = "status-dot ok";
+  const who = (CURRENT_USER && CURRENT_USER.name) ? fmt(CURRENT_USER.name) : "";
+  const txt = $("#jira-status-text");
+  if (who) {
+    $("#jira-status").innerHTML = `connected to <b>${fmt(s.base_url)}</b> as <b>${who}</b>`;
+    if (txt) txt.innerHTML = PROFILE_URL
+      ? `by <a class="hero-user-link" href="${fmt(PROFILE_URL)}" target="_blank" rel="noopener">${who}</a>`
+      : `by ${who}`;
+  } else {
+    // Reads work, but this user hasn't connected their own Jira account yet.
+    $("#jira-status").innerHTML =
+      `connected to <b>${fmt(s.base_url)}</b> — <a href="#" id="jira-status-connect">Connect Jira</a> to act as yourself`;
+    const lnk = $("#jira-status-connect");
+    if (lnk) lnk.addEventListener("click", (e) => { e.preventDefault(); connectJira(); });
+    if (txt) txt.textContent = "not connected";
   }
 }
 
@@ -4152,11 +4232,13 @@ $("#btn-hide-done").addEventListener("click", () => {
   renderAlertBar();
 });
 $("#btn-theme").addEventListener("click", cycleTheme);
+$("#btn-connect-jira")?.addEventListener("click", connectJira);
 
 applyTheme(getTheme());
 
 (async function init() {
-  fetch("/api/me").then(r => r.json()).then(d => { CURRENT_USER = d; }).catch(() => {});
+  await loadCurrentUser();
+  checkJiraConnection();
   await loadConfig();
   await refreshJiraStatus();
   await loadFields();

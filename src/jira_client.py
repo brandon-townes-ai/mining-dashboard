@@ -14,6 +14,23 @@ def _text_to_adf(text: str) -> dict:
             "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}
 
 
+def build_comment_adf(text: str = "", segments: list[dict] | None = None) -> dict:
+    """Build an ADF comment body from plain text or text/mention segments.
+    Shared by JiraClient and DataApiJiraClient."""
+    if segments:
+        content = []
+        for seg in segments:
+            if seg.get("type") == "mention":
+                content.append({"type": "mention",
+                    "attrs": {"id": seg["id"], "text": seg["text"], "accessLevel": ""}})
+            elif seg.get("text"):
+                content.append({"type": "text", "text": seg["text"]})
+    else:
+        content = [{"type": "text", "text": text}]
+    return {"version": 1, "type": "doc",
+            "content": [{"type": "paragraph", "content": content}]}
+
+
 def _format_jira_error(resp: requests.Response) -> str:
     """Turn a Jira error response into a human-readable message.
 
@@ -200,31 +217,9 @@ class JiraClient:
         self._delete(f"issue/{issue_key}/comment/{comment_id}")
 
     def update_comment(self, issue_key: str, comment_id: str, text: str = "", segments: list[dict] | None = None) -> dict:
-        if segments:
-            content = []
-            for seg in segments:
-                if seg.get("type") == "mention":
-                    content.append({"type": "mention",
-                        "attrs": {"id": seg["id"], "text": seg["text"], "accessLevel": ""}})
-                elif seg.get("text"):
-                    content.append({"type": "text", "text": seg["text"]})
-        else:
-            content = [{"type": "text", "text": text}]
-        adf = {"version": 1, "type": "doc",
-               "content": [{"type": "paragraph", "content": content}]}
+        adf = build_comment_adf(text, segments)
         return self._put(f"issue/{issue_key}/comment/{comment_id}", {"body": adf})
 
     def add_comment(self, issue_key: str, text: str = "", segments: list[dict] | None = None) -> dict:
-        if segments:
-            content = []
-            for seg in segments:
-                if seg.get("type") == "mention":
-                    content.append({"type": "mention",
-                        "attrs": {"id": seg["id"], "text": seg["text"], "accessLevel": ""}})
-                elif seg.get("text"):
-                    content.append({"type": "text", "text": seg["text"]})
-        else:
-            content = [{"type": "text", "text": text}]
-        adf = {"version": 1, "type": "doc",
-               "content": [{"type": "paragraph", "content": content}]}
+        adf = build_comment_adf(text, segments)
         return self._post(f"issue/{issue_key}/comment", {"body": adf})
