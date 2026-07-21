@@ -402,14 +402,21 @@ def create_app(store: ConfigStore) -> Flask:
             return jsonify({"stale": [], "jira_base_url": ""})
         client = holder.get()
         mode = view["mode"]
+        # Fields needed to test staleness (_is_stale) and render a panel row for the view's
+        # own issues, used in the fall-back path below.
+        own_fields = ["summary", "status", "updated", "priority", "assignee"]
         if mode == "jql":
             jql = view.get("jql", "").strip()
             if not jql:
                 return jsonify({"stale": [], "jira_base_url": client.base_url})
             jql = _resolve_jql(jql, client)
-            parent_issues = client.search_issues(jql, ["summary"], max_results=100)
+            parent_issues = client.search_issues(jql, own_fields, max_results=100)
         else:
-            parent_issues = [{"key": k, "fields": {"summary": ""}} for k in (view.get("keys") or [])]
+            keylist = [k for k in (view.get("keys") or []) if k]
+            parent_issues = (
+                client.search_issues(f"key in ({', '.join(keylist)})", own_fields, max_results=100)
+                if keylist else []
+            )
         if not parent_issues:
             return jsonify({"stale": [], "jira_base_url": client.base_url})
         parent_keys_in = ", ".join(i["key"] for i in parent_issues)
@@ -418,8 +425,12 @@ def create_app(store: ConfigStore) -> Flask:
         children = client.search_issues(
             f"parent in ({parent_keys_in}) ORDER BY updated ASC", child_fields, max_results=500
         )
+        # Use stale CHILDREN when the view's issues have children (unchanged behaviour, e.g. the
+        # Epics view); otherwise fall back to the view's OWN stale issues so the panel is useful
+        # in leaf-issue views (e.g. the Bugs view). For own issues parent_key is "" -> no chip.
+        candidates = children if children else parent_issues
         stale = []
-        for c in children:
+        for c in candidates:
             fields = c.get("fields") or {}
             if _is_stale(fields):
                 parent_key = (fields.get("parent") or {}).get("key", "")
@@ -2328,7 +2339,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         <span class="stale-callout-dot"></span>
         <span class="stale-callout-title">Stale Issues</span>
         <span class="stale-callout-count" id="stale-callout-count">0</span>
-        <span class="stale-callout-desc">child issues without activity for 24h+</span>
+        <span class="stale-callout-desc">issues without activity for 24h+</span>
         <span class="stale-callout-line"></span>
         <span class="stale-callout-icon" id="stale-callout-icon">▾</span>
       </div>
