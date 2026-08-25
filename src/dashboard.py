@@ -104,13 +104,7 @@ def create_app(store: ConfigStore) -> Flask:
     @app.get("/")
     def index():
         version = os.environ.get("APP_VERSION", _APP_VERSION)
-        email = _get_iap_email(request) or os.environ.get("JIRA_EMAIL", "")
-        user_id = email.split("@")[0] if "@" in email else ""
-        profile_url = (
-            f"https://anaheim.applied.co/anaheim/appliedistan/about?userId={user_id}"
-            if user_id else ""
-        )
-        return render_template_string(DASHBOARD_HTML, version=version, profile_url=profile_url)
+        return render_template_string(DASHBOARD_HTML, version=version)
 
     @app.get("/api/config")
     def api_config_get():
@@ -965,6 +959,10 @@ DASHBOARD_HTML = r"""<!doctype html>
     padding: 10px 14px;
     border-top: 1px solid var(--sb-divider);
     flex-shrink: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 3px 10px;
   }
   .sidebar-footer-meta {
     font-size: 10px;
@@ -1087,41 +1085,6 @@ DASHBOARD_HTML = r"""<!doctype html>
     position: relative;
     top: -0.05em;
   }
-
-  .hero-meta {
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    margin-top: 7px;
-    flex-wrap: wrap;
-  }
-
-  .hero-jira {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: var(--muted);
-  }
-
-  .hero-user-link {
-    color: inherit;
-    text-decoration: none;
-    border-bottom: 1px solid currentColor;
-    opacity: 0.7;
-    transition: opacity var(--t);
-  }
-  .hero-user-link:hover { opacity: 1; }
-
-  .status-dot {
-    width: 6px; height: 6px;
-    border-radius: 50%;
-    background: var(--muted);
-    flex-shrink: 0;
-    transition: background var(--t);
-  }
-  .status-dot.ok  { background: var(--done); }
-  .status-dot.err { background: var(--blocked); }
 
   /* ─── SCROLLABLE CONTENT ─────────────────────── */
   .content {
@@ -1431,12 +1394,79 @@ DASHBOARD_HTML = r"""<!doctype html>
     user-select: none;
   }
   .chart-legend-item:hover { opacity: 0.75; }
-  .chart-legend-item.legend-hidden { opacity: 0.35; text-decoration: line-through; }
+  .chart-legend-item.legend-dimmed { opacity: 0.3; }
+  .chart-legend-item.legend-selected { color: var(--text); font-weight: 600; }
+  .chart-card.has-filter { border-color: var(--muted); }
   .chart-legend-swatch {
     width: 8px;
     height: 8px;
     border-radius: 2px;
     flex-shrink: 0;
+  }
+
+  /* ─── CHART FILTER BAR ──────────────────────────── */
+  .filter-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+  }
+  .filter-bar.hidden { display: none; }
+  .filter-bar-count {
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .filter-bar-count strong { color: var(--text); font-weight: 600; }
+  .filter-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    flex: 1;
+    min-width: 0;
+  }
+  .filter-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 6px 2px 7px;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all var(--t);
+    user-select: none;
+  }
+  .filter-chip:hover { border-color: var(--muted); background: var(--bg-hover); }
+  .filter-chip.stale { opacity: 0.55; border-style: dashed; }
+  .filter-chip-n { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .filter-chip-dim {
+    color: var(--muted);
+    text-transform: uppercase;
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    font-weight: 700;
+  }
+  .filter-chip-x { color: var(--muted); font-size: 12px; line-height: 1; }
+  .filter-chip:hover .filter-chip-x { color: var(--text); }
+
+  tr.empty-row td {
+    text-align: center;
+    padding: 28px 12px;
+    color: var(--text-secondary);
+    font-size: 13px;
+  }
+  tr.empty-row a { color: var(--accent); cursor: pointer; }
+  tr.child-empty td {
+    padding: 6px 12px 6px 34px;
+    color: var(--muted);
+    font-size: 11px;
+    font-style: italic;
   }
 
   /* ─── TABLE ─────────────────────────────────────── */
@@ -2293,6 +2323,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   </div>
   <div class="sidebar-footer">
     <a class="sidebar-footer-meta" href="https://github.com/brandon-townes-ai/mining-dashboard" target="_blank" rel="noopener noreferrer">v{{ version }}</a>
+    <a class="sidebar-footer-meta" href="https://anaheim.applied.co/anaheim/appliedistan/about?userId=brandon.townes" target="_blank" rel="noopener noreferrer">designed by Brandon Townes</a>
   </div>
 </div>
 
@@ -2314,12 +2345,6 @@ DASHBOARD_HTML = r"""<!doctype html>
   <!-- hero -->
   <div class="hero">
     <h1 class="hero-title"><span class="hero-icon">⛏</span> Mining <em>Dashboard</em></h1>
-    <div class="hero-meta">
-      <div class="hero-jira" id="jira-status-hero">
-        <span class="status-dot" id="jira-dot"></span>
-        <span id="jira-status-text">checking connection…</span>
-      </div>
-    </div>
   </div>
 
   <!-- high sev alert bar -->
@@ -2369,6 +2394,13 @@ DASHBOARD_HTML = r"""<!doctype html>
       <button id="btn-load" class="btn-primary">Load</button>
       <button id="btn-save-view" class="btn-ghost">Save view</button>
       <button id="btn-hide-done" class="btn-ghost">Hide Done</button>
+    </div>
+
+    <!-- chart filter chips -->
+    <div class="filter-bar card hidden" id="filter-bar">
+      <span class="filter-bar-count" id="filter-count"></span>
+      <div class="filter-chips" id="filter-chips"></div>
+      <button id="btn-clear-filters" class="btn-ghost">Clear all</button>
     </div>
 
     <!-- table -->
@@ -2471,7 +2503,6 @@ function fmtCommentDate(iso) {
   if (isNaN(d)) return iso;
   return d.toLocaleString(undefined, {year:"numeric",month:"long",day:"numeric",hour:"numeric",minute:"2-digit"});
 }
-const PROFILE_URL = "{{ profile_url }}";
 
 let CURRENT_USER = null;
 
@@ -2489,11 +2520,34 @@ const STATE = {
   sortDir: 1,
   refreshTimer: null,
   hideDone: false,
+  chartFilters: {},   // { [dimCol]: Set<labelString> } — only non-empty keys are present
 };
 
 function getVisibleTickets() {
   if (!STATE.hideDone) return STATE.tickets;
   return STATE.tickets.filter(t => (t.values?.status?.category ?? "") !== "done");
+}
+
+function hasChartFilters() {
+  return Object.keys(STATE.chartFilters).length > 0;
+}
+
+// OR within a dimension, AND across dimensions.
+function matchesChartFilters(t) {
+  for (const [col, selected] of Object.entries(STATE.chartFilters)) {
+    const dim = CHART_DIMS.find(d => d.col === col);
+    if (!dim) continue;
+    if (!labelsForTicket(dim, t).some(l => selected.has(l))) return false;
+  }
+  return true;
+}
+
+// Table-only view: hideDone (from getVisibleTickets) plus the chart slice selections.
+// Charts, KPIs and the alert bar deliberately keep using getVisibleTickets() so they
+// always show unfiltered totals as context for whatever the table is showing.
+function getTableTickets() {
+  if (!hasChartFilters()) return getVisibleTickets();
+  return getVisibleTickets().filter(matchesChartFilters);
 }
 
 let alertBarDismissed = false;
@@ -2806,29 +2860,29 @@ function renderKpis() {
     </div>`).join("");
 }
 
+// Single source of truth for "which chart slice(s) does this ticket belong to?".
+// Both aggregateDim() and matchesChartFilters() go through this so the donut counts
+// and the filtered row set can never drift apart.
+function labelsForTicket(dim, t) {
+  const v = t.values?.[dim.col];
+  if (!v || v.type === "empty") {
+    return dim.col === "assignee" ? ["Unassigned"] : [];
+  }
+  if (dim.list) {
+    return (v.items || []).map(item => item.display || "—");
+  }
+  return [dim.extractor(v) || "—"];
+}
+
 function aggregateDim(dim) {
   const counts = new Map();
   const meta = new Map();
   for (const t of getVisibleTickets()) {
-    const v = t.values?.[dim.col];
-    if (!v || v.type === "empty") {
-      if (dim.col === "assignee") {
-        counts.set("Unassigned", (counts.get("Unassigned") || 0) + 1);
-      }
-      continue;
-    }
-    if (dim.list) {
-      const items = v.items || [];
-      if (!items.length) continue;
-      for (const item of items) {
-        const label = item.display || "—";
-        counts.set(label, (counts.get(label) || 0) + 1);
-      }
-    } else {
-      const label = dim.extractor(v) || "—";
+    for (const label of labelsForTicket(dim, t)) {
       counts.set(label, (counts.get(label) || 0) + 1);
-      if (dim.colorBy === "category" && v.category && !meta.has(label)) {
-        meta.set(label, {category: v.category});
+      if (dim.colorBy === "category") {
+        const cat = t.values?.[dim.col]?.category;
+        if (cat && !meta.has(label)) meta.set(label, {category: cat});
       }
     }
   }
@@ -2886,27 +2940,170 @@ function renderCharts() {
           }
         },
         cutout: "55%",
+        onClick: (evt, elements, chartRef) => {
+          let idx = elements && elements.length ? elements[0].index : -1;
+          if (idx < 0) {
+            const hit = chartRef.getElementsAtEventForMode(
+              evt, "nearest", {intersect: true}, false);
+            if (hit.length) idx = hit[0].index;
+          }
+          if (idx < 0) return;
+          const label = chartRef.data.labels[idx];
+          if (label != null) toggleChartFilter(dim.col, label);
+        },
+        onHover: (evt, elements) => {
+          const t = evt?.native?.target;
+          if (t) t.style.cursor = elements.length ? "pointer" : "default";
+        },
       },
     });
     CHART_INSTANCES.set(dim.col, chart);
+    chart.$baseColors = colors;
 
-    // Custom HTML legend — wraps freely, never truncates, click to toggle slice
+    // Custom HTML legend — wraps freely, never truncates. Clicking a legend item does
+    // exactly what clicking its slice does: toggles that label into the table filter.
     const legendEl = cardEl.querySelector(".chart-legend");
     legendEl.innerHTML = agg.labels.map((label, i) =>
-      `<span class="chart-legend-item" data-idx="${i}">
+      `<span class="chart-legend-item" data-label="${fmt(label)}">
         <span class="chart-legend-swatch" style="background:${colors[i]}"></span>
         ${fmt(label)}
       </span>`
     ).join("");
     legendEl.querySelectorAll(".chart-legend-item").forEach(item => {
-      item.addEventListener("click", () => {
-        const idx = parseInt(item.dataset.idx, 10);
-        chart.toggleDataVisibility(idx);
-        chart.update();
-        item.classList.toggle("legend-hidden");
-      });
+      item.addEventListener("click", () => toggleChartFilter(dim.col, item.dataset.label));
     });
   }
+
+  // renderCharts() destroys and rebuilds every instance, so selection styling has to be
+  // re-applied here — this is what lets an active filter survive the 60s auto-refresh.
+  updateChartSelectionStyles();
+}
+
+function dimLabel(col) {
+  const dim = CHART_DIMS.find(d => d.col === col);
+  return (dim?.title || col).replace(/^By /i, "");
+}
+
+function toggleChartFilter(col, label) {
+  if (label == null) return;
+  const set = STATE.chartFilters[col] || new Set();
+  if (set.has(label)) set.delete(label); else set.add(label);
+  if (set.size) STATE.chartFilters[col] = set;
+  else delete STATE.chartFilters[col];
+  applyChartFilterChange();
+}
+
+function clearChartFilters() {
+  if (!hasChartFilters()) return;
+  STATE.chartFilters = {};
+  applyChartFilterChange();
+}
+
+// A filter change is cheap: the charts keep their existing aggregation, so we only
+// restyle them rather than calling renderCharts().
+function applyChartFilterChange() {
+  renderTable();
+  updateChartSelectionStyles();
+  renderFilterChips();
+  syncFiltersToUrl();
+}
+
+// Dim the unselected slices in place. Colors come from CATEGORY_COLOR / PALETTE, which
+// are all 6-digit hex, so appending "33" gives us ~20% alpha without a color library.
+function updateChartSelectionStyles() {
+  for (const [col, chart] of CHART_INSTANCES) {
+    const selected = STATE.chartFilters[col];
+    const active = !!(selected && selected.size);
+    const base = chart.$baseColors || [];
+    const ds = chart.data.datasets[0];
+    ds.backgroundColor = chart.data.labels.map((l, i) => {
+      const c = base[i] || PALETTE[0];
+      return !active || selected.has(l) ? c : c + "33";
+    });
+    ds.offset      = chart.data.labels.map(l => active && selected.has(l) ? 8 : 0);
+    ds.borderWidth = chart.data.labels.map(l => active && selected.has(l) ? 2 : 1);
+    chart.update("none");
+
+    const card = document.querySelector(`.chart-card[data-col="${CSS.escape(col)}"]`);
+    if (!card) continue;
+    card.classList.toggle("has-filter", active);
+    card.querySelectorAll(".chart-legend-item").forEach(item => {
+      const on = !active || selected.has(item.dataset.label);
+      item.classList.toggle("legend-dimmed", !on);
+      item.classList.toggle("legend-selected", active && on);
+    });
+  }
+}
+
+function renderFilterChips() {
+  const bar = $("#filter-bar");
+  if (!bar) return;
+  if (!hasChartFilters()) { bar.classList.add("hidden"); return; }
+  bar.classList.remove("hidden");
+
+  const shown = getTableTickets().length;
+  const total = getVisibleTickets().length;
+  $("#filter-count").innerHTML =
+    `Showing <strong>${fmt(shown)}</strong> of <strong>${fmt(total)}</strong>`;
+
+  // Count per chip against the unfiltered pool, so a label that no longer matches
+  // anything (e.g. the last P1 got closed, or Hide Done just hid it) is visibly
+  // stale rather than silently responsible for an empty table.
+  const pool = getVisibleTickets();
+  const pairs = [];
+  for (const [col, set] of Object.entries(STATE.chartFilters)) {
+    const dim = CHART_DIMS.find(d => d.col === col);
+    for (const label of set) {
+      const n = dim ? pool.filter(t => labelsForTicket(dim, t).includes(label)).length : 0;
+      pairs.push([col, label, n]);
+    }
+  }
+  const chips = $("#filter-chips");
+  chips.innerHTML = pairs.map(([col, label, n]) =>
+    `<span class="filter-chip${n ? "" : " stale"}" data-col="${fmt(col)}" data-label="${fmt(label)}"` +
+    ` title="${n ? "Click to remove" : "Nothing currently matches this value — click to remove"}">` +
+    `<span class="filter-chip-dim">${fmt(dimLabel(col))}</span>` +
+    `${fmt(label)}<span class="filter-chip-n">${fmt(n)}</span>` +
+    `<span class="filter-chip-x">×</span></span>`
+  ).join("");
+  chips.querySelectorAll(".filter-chip").forEach(chip => {
+    chip.addEventListener("click", () =>
+      toggleChartFilter(chip.dataset.col, chip.dataset.label));
+  });
+}
+
+// Repeated params rather than comma-joined values: component names and "Last, First"
+// display names contain commas, and URLSearchParams encodes a literal comma exactly
+// like a separator, so joining would be ambiguous. getAll() handles repeats natively.
+function syncFiltersToUrl() {
+  const p = new URLSearchParams();
+  for (const [col, set] of Object.entries(STATE.chartFilters)) {
+    for (const l of set) p.append(col, l);
+  }
+  const qs = p.toString();
+  // replaceState, not pushState — a slice click adjusts the view, it isn't navigation.
+  history.replaceState(null, "", qs ? `?${qs}` : location.pathname);
+}
+
+// Must run after loadTickets() resolves: STATE.columns is unknown before that, and it
+// is what tells us which dimensions actually exist in this view.
+function readFiltersFromUrl() {
+  const p = new URLSearchParams(location.search);
+  const next = {};
+  for (const dim of CHART_DIMS) {
+    if (!STATE.columns.includes(dim.col)) continue;
+    const vals = p.getAll(dim.col).filter(Boolean);
+    if (vals.length) next[dim.col] = new Set(vals);
+  }
+  STATE.chartFilters = next;
+}
+
+function rerenderAll() {
+  renderKpis();
+  renderCharts();
+  renderTable();
+  renderAlertBar();
+  renderFilterChips();
 }
 
 async function loadTickets() {
@@ -2938,10 +3135,7 @@ async function loadTickets() {
     DETAIL_CACHE.clear();
     TRANSITIONS_CACHE.clear();
     alertBarDismissed = false;
-    renderKpis();
-    renderCharts();
-    renderTable();
-    renderAlertBar();
+    rerenderAll();
     loadStaleChildren();
     $("#status").textContent = `${STATE.tickets.length} ticket(s) · ${new Date().toLocaleTimeString()}`;
     scheduleRefresh();
@@ -3919,7 +4113,7 @@ function renderTable() {
     }
   });
 
-  const rows = [...getVisibleTickets()];
+  const rows = [...getTableTickets()];
   if (STATE.sortKey) {
     rows.sort((a, b) => {
       const av = sortValueFor(a, STATE.sortKey);
@@ -3931,6 +4125,18 @@ function renderTable() {
 
   const tbody = $("#tbl tbody");
   tbody.innerHTML = "";
+
+  if (!rows.length) {
+    const tr = document.createElement("tr");
+    tr.className = "empty-row";
+    tr.innerHTML = `<td colspan="${STATE.columns.length || 1}">` + (hasChartFilters()
+      ? `No issues match the current filters. <a id="empty-clear">Clear all</a>`
+      : `No issues to show.`) + `</td>`;
+    tbody.appendChild(tr);
+    tbody.querySelector("#empty-clear")?.addEventListener("click", clearChartFilters);
+    return;
+  }
+
   for (const t of rows) {
     const tr = document.createElement("tr");
     tr.dataset.key = t.key;
@@ -3994,9 +4200,11 @@ function appendChildRows(tbody, key, columns, afterRow) {
 }
 
 function insertChildRows(tbody, key, columns, tickets, afterRow) {
-  const visible = STATE.hideDone
-    ? tickets.filter(t => (t.values?.status?.category ?? "") !== "done")
-    : tickets;
+  // Mirrors getTableTickets(): children are rows in the table too, so filtering to P1
+  // and expanding a parent must not surface its P2 children.
+  const visible = tickets.filter(t =>
+    (!STATE.hideDone || (t.values?.status?.category ?? "") !== "done") &&
+    matchesChartFilters(t));
   const frag = document.createDocumentFragment();
   for (const t of visible) {
     const tr = document.createElement("tr");
@@ -4011,6 +4219,13 @@ function insertChildRows(tbody, key, columns, tickets, afterRow) {
       if (e.target.closest("a")) return;
       openDetailPanel(t.key);
     });
+    frag.appendChild(tr);
+  }
+  if (!visible.length && tickets.length) {
+    const tr = document.createElement("tr");
+    tr.className = "child-row child-empty";
+    tr.dataset.parent = key;
+    tr.innerHTML = `<td colspan="${columns.length || 1}">No children match the current filters</td>`;
     frag.appendChild(tr);
   }
   const ref = afterRow ? afterRow.nextSibling : null;
@@ -4076,6 +4291,9 @@ async function saveCurrentView() {
 
 async function switchView(name) {
   await api("/api/active_view", {method: "POST", body: {name}});
+  // Slice labels are meaningless across views, so start the new view unfiltered.
+  STATE.chartFilters = {};
+  syncFiltersToUrl();
   await loadConfig();
   await loadTickets();
 }
@@ -4118,9 +4336,10 @@ async function deleteCurrentView() {
 }
 
 async function refreshJiraStatus() {
-  // The connection panel reflects the LOGGED-IN user (their own per-user Jira identity
-  // via the Data API), not the shared read credential. /api/jira/status is used only to
-  // confirm the dashboard can read Jira (health dot + base URL).
+  // Reflects the LOGGED-IN user (their own per-user Jira identity via the Data API),
+  // not the shared read credential. /api/jira/status only confirms the dashboard can
+  // read Jira. This is surfaced in the Settings drawer only — the hero carries no
+  // status line and no byline (the old one wrongly named whoever was logged in).
   let s;
   try {
     s = await api("/api/jira/status");
@@ -4128,29 +4347,19 @@ async function refreshJiraStatus() {
     $("#jira-status").innerHTML = `<span class="err">${fmt(e.message)}</span>`;
     return;
   }
-  const dot = $("#jira-dot");
   if (!s.ok) {
     $("#jira-status").innerHTML = `<span class="err">${fmt(s.error || "cannot reach Jira")}</span>`;
-    if (dot) dot.className = "status-dot err";
-    const txt = $("#jira-status-text");
-    if (txt) txt.textContent = "not connected";
     return;
   }
-  if (dot) dot.className = "status-dot ok";
   const who = (CURRENT_USER && CURRENT_USER.name) ? fmt(CURRENT_USER.name) : "";
-  const txt = $("#jira-status-text");
   if (who) {
     $("#jira-status").innerHTML = `connected to <b>${fmt(s.base_url)}</b> as <b>${who}</b>`;
-    if (txt) txt.innerHTML = PROFILE_URL
-      ? `by <a class="hero-user-link" href="${fmt(PROFILE_URL)}" target="_blank" rel="noopener">${who}</a>`
-      : `by ${who}`;
   } else {
     // Reads work, but this user hasn't connected their own Jira account yet.
     $("#jira-status").innerHTML =
       `connected to <b>${fmt(s.base_url)}</b> — <a href="#" id="jira-status-connect">Connect Jira</a> to act as yourself`;
     const lnk = $("#jira-status-connect");
     if (lnk) lnk.addEventListener("click", (e) => { e.preventDefault(); connectJira(); });
-    if (txt) txt.textContent = "not connected";
   }
 }
 
@@ -4237,11 +4446,9 @@ $("#btn-hide-done").addEventListener("click", () => {
   const btn = $("#btn-hide-done");
   btn.classList.toggle("active", STATE.hideDone);
   btn.textContent = STATE.hideDone ? "Show Done" : "Hide Done";
-  renderKpis();
-  renderCharts();
-  renderTable();
-  renderAlertBar();
+  rerenderAll();
 });
+$("#btn-clear-filters").addEventListener("click", clearChartFilters);
 $("#btn-theme").addEventListener("click", cycleTheme);
 $("#btn-connect-jira")?.addEventListener("click", connectJira);
 
@@ -4255,6 +4462,8 @@ applyTheme(getTheme());
   await loadFields();
   if (STATE.workingView && (STATE.workingView.jql || (STATE.workingView.keys || []).length)) {
     await loadTickets();
+    readFiltersFromUrl();
+    if (hasChartFilters()) applyChartFilterChange();
   } else {
     $("#status").textContent = "configure a view to get started";
   }
